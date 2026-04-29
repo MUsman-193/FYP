@@ -1,0 +1,14 @@
+﻿name: toxic_comment_env
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - jupyter
+  - notebook
+  - pip:
+      - pandas>=2.0.0
+      - scikit-learn>=1.3.0
+      - numpy>=1.24.0
+      - openpyxl>=3.1.0
+      - nltk>=3.8.0
