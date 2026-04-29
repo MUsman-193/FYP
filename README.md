@@ -1,4 +1,4 @@
-﻿# Toxic Comment Classification
+# Toxic Comment Classification
 
 Desktop workbench for dataset cleaning, augmentation, and model investigation/training.
 
