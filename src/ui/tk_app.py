@@ -155,6 +155,7 @@ class _RoundedButton(tk.Canvas):
         pady: int = 10,
         hover_bg: str | None = None,
         active_bg: str | None = None,
+        enabled: bool = True,
     ) -> None:
         super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
         self._text = text
@@ -169,6 +170,16 @@ class _RoundedButton(tk.Canvas):
         self._hover_bg = hover_bg or bg
         self._active_bg = active_bg or self._hover_bg
 
+        self._enabled = enabled
+        self._bg_enabled = self._bg
+        self._fg_enabled = self._fg
+        self._border_enabled = self._border
+        self._hover_bg_enabled = self._hover_bg
+        self._active_bg_enabled = self._active_bg
+        self._disabled_bg = "#e5e7eb"
+        self._disabled_fg = "#9ca3af"
+        self._disabled_border = "#d1d5db"
+
         self._shape_id: int | None = None
         self._text_id: int | None = None
 
@@ -176,6 +187,8 @@ class _RoundedButton(tk.Canvas):
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", self._on_click)
+
+        self.set_enabled(self._enabled)
 
     def _draw(self, _event: tk.Event) -> None:
         w = max(1, int(self.winfo_width()))
@@ -207,15 +220,42 @@ class _RoundedButton(tk.Canvas):
             self.itemconfigure(self._shape_id, fill=color)
 
     def _on_enter(self, _event: tk.Event) -> None:
+        if not self._enabled:
+            return
         self._set_bg(self._hover_bg)
 
     def _on_leave(self, _event: tk.Event) -> None:
+        if not self._enabled:
+            return
         self._set_bg(self._bg)
 
     def _on_click(self, _event: tk.Event) -> None:
+        if not self._enabled:
+            return
         self._set_bg(self._active_bg)
         self.after(120, lambda: self._set_bg(self._hover_bg))
         self._command()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        if self._enabled:
+            self._bg = self._bg_enabled
+            self._fg = self._fg_enabled
+            self._border = self._border_enabled
+            self._hover_bg = self._hover_bg_enabled
+            self._active_bg = self._active_bg_enabled
+            self.configure(cursor="hand2")
+        else:
+            self._bg = self._disabled_bg
+            self._fg = self._disabled_fg
+            self._border = self._disabled_border
+            self._hover_bg = self._disabled_bg
+            self._active_bg = self._disabled_bg
+            self.configure(cursor="arrow")
+
+        # Redraw immediately if already laid out.
+        if self.winfo_width() > 1 and self.winfo_height() > 1:
+            self._draw(tk.Event())
 
     def autosize(self) -> None:
         # Approximate width based on text length (keeps layout stable without measuring fonts).
@@ -286,6 +326,16 @@ class ToxicCommentApp:
             self._log(msg)
 
     def _build_ui(self) -> None:
+        # Shared design tokens (keep sidebar + right panel consistent)
+        self._tox_blue = _hsl_to_hex(221, 83, 53)
+        self._tox_green = _hsl_to_hex(142, 71, 45)
+        self._tox_green_bg = _hsl_to_hex(142, 71, 95)
+        self._tox_border = "#e5e7eb"
+        self._tox_text = "#111827"
+        self._tox_muted = "#6b7280"
+        self._tox_bg = "#f9fafb"
+        self._tox_card_bg = "#ffffff"
+
         container = ttk.Frame(self.root, padding=10)
         container.pack(fill="both", expand=True)
 
@@ -311,7 +361,7 @@ class ToxicCommentApp:
 
         left_wrapper = ttk.Frame(middle)
         left_wrapper.pack(side="left", fill="y")
-        self.left_canvas = tk.Canvas(left_wrapper, width=380, highlightthickness=0)
+        self.left_canvas = tk.Canvas(left_wrapper, width=380, highlightthickness=0, bg=self._tox_bg)
         left_scrollbar = ttk.Scrollbar(
             left_wrapper, orient="vertical", command=self.left_canvas.yview
         )
@@ -319,7 +369,7 @@ class ToxicCommentApp:
         self.left_canvas.pack(side="left", fill="y")
         left_scrollbar.pack(side="left", fill="y")
 
-        left = ttk.Frame(self.left_canvas)
+        left = tk.Frame(self.left_canvas, bg=self._tox_bg)
         self.left_canvas_window = self.left_canvas.create_window(
             (0, 0), window=left, anchor="nw"
         )
@@ -331,8 +381,23 @@ class ToxicCommentApp:
         right = ttk.Frame(middle)
         right.pack(side="left", fill="both", expand=True, padx=(12, 0))
 
-        prep_frame = ttk.LabelFrame(left, text="Preprocessing", padding=8)
-        prep_frame.pack(fill="x")
+        def _sidebar_card(parent: tk.Misc, title: str) -> tk.Frame:
+            card = _RoundedCard(parent, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(12, 12))
+            card.pack(fill="x", padx=10, pady=(0, 10))
+            inner = card.inner
+            tk.Label(
+                inner,
+                text=title,
+                font=("Segoe UI", 11, "bold"),
+                bg=self._tox_card_bg,
+                fg=self._tox_text,
+            ).pack(anchor="w", pady=(0, 10))
+            return inner
+
+        def _divider(parent: tk.Misc) -> None:
+            tk.Frame(parent, bg=self._tox_border, height=1).pack(fill="x", pady=(10, 10))
+
+        prep_frame = _sidebar_card(left, "Preprocessing")
         prep_labels = [
             ("Lowercasing", "lowercase"),
             ("Remove Punctuation", "remove_punctuation"),
@@ -340,23 +405,58 @@ class ToxicCommentApp:
             ("Remove Numbers", "remove_numbers"),
             ("Normalize Extra Whitespace", "normalize_whitespace"),
         ]
-        for idx, (label, key) in enumerate(prep_labels):
-            ttk.Checkbutton(
+        for label, key in prep_labels:
+            tk.Checkbutton(
                 prep_frame,
                 text=label,
                 variable=self.prep_vars[key],
                 onvalue=True,
                 offvalue=False,
-            ).grid(row=idx, column=0, sticky="w")
-        ttk.Button(
-            prep_frame, text="Suggest Preprocessing", command=self._suggest_preprocessing
-        ).grid(row=len(prep_labels), column=0, sticky="we", pady=(8, 0))
-        ttk.Button(
-            prep_frame, text="Apply Selected Preprocessing", command=self._apply_preprocessing
-        ).grid(row=len(prep_labels) + 1, column=0, sticky="we", pady=(6, 0))
+                bg=self._tox_card_bg,
+                fg=self._tox_text,
+                activebackground=self._tox_card_bg,
+                activeforeground=self._tox_text,
+                selectcolor=self._tox_card_bg,
+                anchor="w",
+            ).pack(fill="x", anchor="w")
 
-        aug_frame = ttk.LabelFrame(left, text="Data Augmentation", padding=8)
-        aug_frame.pack(fill="x", pady=10)
+        _divider(prep_frame)
+        btn_row = tk.Frame(prep_frame, bg=self._tox_card_bg)
+        btn_row.pack(fill="x")
+        suggest_btn = _RoundedButton(
+            btn_row,
+            text="Suggest",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._suggest_preprocessing,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
+        )
+        suggest_btn.configure(height=34)
+        suggest_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self._prep_apply_btn = _RoundedButton(
+            btn_row,
+            text="Apply",
+            bg=self._tox_blue,
+            fg="#ffffff",
+            command=self._apply_preprocessing,
+            border=self._tox_blue,
+            radius=12,
+            hover_bg=self._tox_blue,
+            active_bg=self._tox_blue,
+        )
+        self._prep_apply_btn.configure(height=34)
+        self._prep_apply_btn.pack(side="left", fill="x", expand=True)
+
+        # Start disabled; enable once user selects any preprocessing option (or after Suggest sets options).
+        self._prep_apply_btn.set_enabled(False)
+        for _v in self.prep_vars.values():
+            _v.trace_add("write", lambda *_: self._update_preprocessing_apply_state())
+
+        aug_frame = _sidebar_card(left, "Data Augmentation")
         aug_labels = [
             ("Synonym Replacement", "synonym_replacement"),
             ("Random Insertion", "random_insertion"),
@@ -368,37 +468,75 @@ class ToxicCommentApp:
             ("Sentence Cropping/Truncation", "sentence_cropping"),
             ("Noise Injection", "noise_injection"),
         ]
-        for idx, (label, key) in enumerate(aug_labels):
-            ttk.Checkbutton(
+        for label, key in aug_labels:
+            tk.Checkbutton(
                 aug_frame,
                 text=label,
                 variable=self.aug_vars[key],
                 onvalue=True,
                 offvalue=False,
-            ).grid(row=idx, column=0, sticky="w")
-        ttk.Label(aug_frame, text="Strength (0.01 - 0.5)").grid(
-            row=len(aug_labels), column=0, sticky="w", pady=(6, 0)
-        )
+                bg=self._tox_card_bg,
+                fg=self._tox_text,
+                activebackground=self._tox_card_bg,
+                activeforeground=self._tox_text,
+                selectcolor=self._tox_card_bg,
+                anchor="w",
+            ).pack(fill="x", anchor="w")
+
+        _divider(aug_frame)
+        strength_row = tk.Frame(aug_frame, bg=self._tox_card_bg)
+        strength_row.pack(fill="x")
+        tk.Label(
+            strength_row,
+            text="Strength",
+            font=("Segoe UI", 9),
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+        ).pack(side="left")
         ttk.Spinbox(
-            aug_frame,
+            strength_row,
             from_=0.01,
             to=0.50,
             increment=0.01,
             textvariable=self.aug_strength_var,
             width=8,
-        ).grid(row=len(aug_labels) + 1, column=0, sticky="w")
-        ttk.Button(
-            aug_frame, text="Apply Selected Augmentation", command=self._apply_augmentation
-        ).grid(row=len(aug_labels) + 2, column=0, sticky="we", pady=(8, 0))
+        ).pack(side="right")
 
-        model_frame = ttk.LabelFrame(left, text="Model Investigation", padding=8)
-        model_frame.pack(fill="x")
-        ttk.Button(
-            model_frame, text="Investigate Architectures", command=self._investigate_architectures
-        ).grid(row=0, column=0, sticky="we")
-        ttk.Label(model_frame, text="Selected Architecture").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
+        apply_aug_btn = _RoundedButton(
+            aug_frame,
+            text="Apply Augmentation",
+            bg=self._tox_blue,
+            fg="#ffffff",
+            command=self._apply_augmentation,
+            border=self._tox_blue,
+            radius=12,
+            hover_bg=self._tox_blue,
+            active_bg=self._tox_blue,
         )
+        apply_aug_btn.configure(height=34)
+        apply_aug_btn.pack(fill="x", pady=(10, 0))
+
+        model_frame = _sidebar_card(left, "Model Investigation")
+        investigate_btn = _RoundedButton(
+            model_frame,
+            text="Investigate Architectures",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._investigate_architectures,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
+        )
+        investigate_btn.configure(height=34)
+        investigate_btn.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            model_frame,
+            text="Selected Architecture",
+            font=("Segoe UI", 9),
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+        ).pack(anchor="w")
         self.model_combo = ttk.Combobox(
             model_frame,
             textvariable=self.model_var,
@@ -408,50 +546,117 @@ class ToxicCommentApp:
             else [],
             width=30,
         )
-        self.model_combo.grid(row=2, column=0, sticky="we")
-        self.train_button = ttk.Button(
-            model_frame, text="Train Selected Model", command=self._train_selected
+        self.model_combo.pack(fill="x", pady=(6, 10))
+        self.train_button = _RoundedButton(
+            model_frame,
+            text="Train Selected Model",
+            bg=self._tox_blue,
+            fg="#ffffff",
+            command=self._train_selected,
+            border=self._tox_blue,
+            radius=12,
+            hover_bg=self._tox_blue,
+            active_bg=self._tox_blue,
         )
-        self.train_button.grid(row=3, column=0, sticky="we", pady=(8, 0))
-        ttk.Button(model_frame, text="Save Processed Dataset", command=self._save_dataset).grid(
-            row=4, column=0, sticky="we", pady=(8, 0)
+        self.train_button.configure(height=34)
+        self.train_button.pack(fill="x")
+        save_btn = _RoundedButton(
+            model_frame,
+            text="Save Processed Dataset",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._save_dataset,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
         )
+        save_btn.configure(height=34)
+        save_btn.pack(fill="x", pady=(8, 0))
         if not self._modeling_available:
             self.model_combo.configure(state="disabled")
             self.train_button.configure(state="disabled")
-            # The investigate button is created earlier; disable it too.
+
+            # Disable the investigate button too.
             for child in model_frame.winfo_children():
-                if isinstance(child, ttk.Button) and child.cget("text") == "Investigate Architectures":
+                if isinstance(child, _RoundedButton) and getattr(child, "_text", "") == "Investigate Architectures":
                     child.configure(state="disabled")
                     break
 
-        scan_frame = ttk.LabelFrame(left, text="Profanity Scan", padding=8)
-        scan_frame.pack(fill="x", pady=10)
-        ttk.Button(
-            scan_frame, text="Scan Dataset (Vulgar Words)", command=self._scan_profanity
-        ).grid(row=0, column=0, sticky="we")
-        ttk.Label(
+        scan_frame = _sidebar_card(left, "Profanity Scan")
+        scan_btn = _RoundedButton(
+            scan_frame,
+            text="Scan Dataset (Vulgar Words)",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._scan_profanity,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
+        )
+        scan_btn.configure(height=34)
+        scan_btn.pack(fill="x")
+        tk.Label(
             scan_frame,
             text="Adds columns: has_profanity, profanity_count, profanity_matches",
-            wraplength=340,
+            font=("Segoe UI", 9),
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+            wraplength=320,
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ).pack(anchor="w", pady=(8, 0))
 
-        clean_frame = ttk.LabelFrame(left, text="Clean / Replace Profanity", padding=8)
-        clean_frame.pack(fill="x")
-        ttk.Radiobutton(
-            clean_frame, text="Mask", value="mask", variable=self.clean_mode_var
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            clean_frame, text="Replace (mapped)", value="replace", variable=self.clean_mode_var
-        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        ttk.Label(clean_frame, text="Mask token").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(clean_frame, textvariable=self.clean_mask_var, width=18).grid(
-            row=1, column=1, sticky="w", pady=(6, 0)
+        clean_frame = _sidebar_card(left, "Clean / Replace Profanity")
+        mode_row = tk.Frame(clean_frame, bg=self._tox_card_bg)
+        mode_row.pack(fill="x")
+        tk.Radiobutton(
+            mode_row,
+            text="Mask",
+            value="mask",
+            variable=self.clean_mode_var,
+            bg=self._tox_card_bg,
+            fg=self._tox_text,
+            activebackground=self._tox_card_bg,
+            activeforeground=self._tox_text,
+            selectcolor=self._tox_card_bg,
+        ).pack(side="left")
+        tk.Radiobutton(
+            mode_row,
+            text="Replace (mapped)",
+            value="replace",
+            variable=self.clean_mode_var,
+            bg=self._tox_card_bg,
+            fg=self._tox_text,
+            activebackground=self._tox_card_bg,
+            activeforeground=self._tox_text,
+            selectcolor=self._tox_card_bg,
+        ).pack(side="left", padx=(10, 0))
+
+        token_row = tk.Frame(clean_frame, bg=self._tox_card_bg)
+        token_row.pack(fill="x", pady=(10, 0))
+        tk.Label(
+            token_row,
+            text="Mask token",
+            font=("Segoe UI", 9),
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+        ).pack(side="left")
+        ttk.Entry(token_row, textvariable=self.clean_mask_var, width=18).pack(side="right")
+
+        clean_btn = _RoundedButton(
+            clean_frame,
+            text="Apply Cleaning",
+            bg=self._tox_blue,
+            fg="#ffffff",
+            command=self._clean_profanity,
+            border=self._tox_blue,
+            radius=12,
+            hover_bg=self._tox_blue,
+            active_bg=self._tox_blue,
         )
-        ttk.Button(clean_frame, text="Apply Cleaning", command=self._clean_profanity).grid(
-            row=2, column=0, columnspan=2, sticky="we", pady=(8, 0)
-        )
+        clean_btn.configure(height=34)
+        clean_btn.pack(fill="x", pady=(10, 0))
 
         # Right side: unified interface (Preview + Logs + Toxicity Analysis)
         merged = ttk.Frame(right, padding=0)
@@ -978,6 +1183,7 @@ class ToxicCommentApp:
         self.prep_vars["remove_stopwords"].set(cfg.remove_stopwords)
         self.prep_vars["remove_numbers"].set(cfg.remove_numbers)
         self.prep_vars["normalize_whitespace"].set(cfg.normalize_whitespace)
+        self._update_preprocessing_apply_state()
 
         self._log("Suggested preprocessing updated from dataset statistics:")
         for key, value in stats.items():
@@ -1005,6 +1211,13 @@ class ToxicCommentApp:
         self.df["processed_text"] = text_series.apply(lambda t: self.preprocessor.apply(t, cfg))
         self._show_preview(self.df)
         self._log("Applied preprocessing. Output column: processed_text")
+
+    def _update_preprocessing_apply_state(self) -> None:
+        btn = getattr(self, "_prep_apply_btn", None)
+        if btn is None:
+            return
+        enabled = any(v.get() for v in self.prep_vars.values())
+        btn.set_enabled(enabled)
 
     def _build_aug_config(self) -> AugmentConfig:
         strength = float(self.aug_strength_var.get())
