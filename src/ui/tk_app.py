@@ -231,6 +231,7 @@ class ToxicCommentApp:
         self.root.geometry("1280x800")
 
         self.df: pd.DataFrame | None = None
+        self._dataset_path: Path | None = None
 
         self.preprocessor = TextPreprocessor()
         self.augmenter = TextAugmenter(seed=42)
@@ -291,28 +292,19 @@ class ToxicCommentApp:
         top = ttk.LabelFrame(container, text="Dataset", padding=10)
         top.pack(fill="x")
 
-        ttk.Label(top, text="File").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.file_var, width=90).grid(
-            row=0, column=1, padx=6, sticky="we"
-        )
-        ttk.Button(top, text="Browse", command=self._browse_file).grid(row=0, column=2)
-        ttk.Button(top, text="Load Dataset", command=self._load_dataset).grid(
-            row=0, column=3, padx=6
-        )
-
-        ttk.Label(top, text="Text Column").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(top, text="Text Column").grid(row=0, column=0, sticky="w")
         self.text_col_combo = ttk.Combobox(
             top, textvariable=self.text_col_var, state="readonly", width=35
         )
-        self.text_col_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self.text_col_combo.grid(row=0, column=1, sticky="w")
 
         ttk.Label(top, text="Label Column").grid(
-            row=1, column=2, sticky="e", pady=(8, 0), padx=(15, 6)
+            row=0, column=2, sticky="e", padx=(15, 6)
         )
         self.label_col_combo = ttk.Combobox(
             top, textvariable=self.label_col_var, state="readonly", width=30
         )
-        self.label_col_combo.grid(row=1, column=3, sticky="w", pady=(8, 0))
+        self.label_col_combo.grid(row=0, column=3, sticky="w")
 
         middle = ttk.Frame(container)
         middle.pack(fill="both", expand=True, pady=10)
@@ -461,46 +453,10 @@ class ToxicCommentApp:
             row=2, column=0, columnspan=2, sticky="we", pady=(8, 0)
         )
 
-        # Right side: keep the existing preview/logs, but also add a "Toxicity Analysis"
-        # screen (matching the provided screenshot) as a second tab.
-        right_tabs = ttk.Notebook(right)
-        right_tabs.pack(fill="both", expand=True)
-
-        tab_dataset = ttk.Frame(right_tabs, padding=0)
-        tab_toxicity = ttk.Frame(right_tabs, padding=0)
-        right_tabs.add(tab_dataset, text="Preview / Logs")
-        right_tabs.add(tab_toxicity, text="Toxicity Analysis")
-
-        preview_frame = ttk.LabelFrame(tab_dataset, text="Dataset Preview", padding=8)
-        preview_frame.pack(fill="both", expand=True)
-        preview_grid = ttk.Frame(preview_frame)
-        preview_grid.pack(fill="both", expand=True)
-        self.preview_text = tk.Text(
-            preview_grid,
-            height=18,
-            wrap="none",
-            undo=False,
-            exportselection=False,
-            padx=20,
-        )
-        self.preview_text.tag_configure("left", justify="left")
-        preview_v = ttk.Scrollbar(preview_grid, orient="vertical", command=self.preview_text.yview)
-        preview_h = ttk.Scrollbar(preview_grid, orient="horizontal", command=self.preview_text.xview)
-        self.preview_text.configure(yscrollcommand=preview_v.set, xscrollcommand=preview_h.set)
-        self.preview_text.grid(row=0, column=0, sticky="nsew")
-        preview_v.grid(row=0, column=1, sticky="ns")
-        preview_h.grid(row=1, column=0, sticky="ew")
-        preview_grid.rowconfigure(0, weight=1)
-        preview_grid.columnconfigure(0, weight=1)
-        self.preview_text.bind("<MouseWheel>", self._on_preview_mousewheel)
-        self.preview_text.bind("<Enter>", self._preview_text_focus_in)
-
-        result_frame = ttk.LabelFrame(tab_dataset, text="Logs / Results", padding=8)
-        result_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.result_text = tk.Text(result_frame, height=16, wrap="word")
-        self.result_text.pack(fill="both", expand=True)
-
-        self._build_toxicity_tab(tab_toxicity)
+        # Right side: unified interface (Preview + Logs + Toxicity Analysis)
+        merged = ttk.Frame(right, padding=0)
+        merged.pack(fill="both", expand=True)
+        self._build_toxicity_tab(merged)
 
     def _build_toxicity_tab(self, parent: ttk.Frame) -> None:
         # Design colors (from user spec)
@@ -553,6 +509,15 @@ class ToxicCommentApp:
             bg=self._tox_bg,
             fg=self._tox_muted,
         ).pack(pady=(0, 14))
+
+        # Toxicity analysis section (analysis shown above Logs/Results)
+        tk.Label(
+            body,
+            text="Toxicity Analysis",
+            font=("Segoe UI", 14, "bold"),
+            bg=self._tox_bg,
+            fg=self._tox_text,
+        ).pack(anchor="w", padx=18, pady=(4, 10))
 
         # Input card
         input_card = _RoundedCard(body, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(14, 14))
@@ -709,19 +674,69 @@ class ToxicCommentApp:
         # Keep results hidden until first Analyze click
         self._tox_results_visible = False
 
+        # Logs / Results (placed AFTER analysis + analysis results)
+        tk.Label(
+            body,
+            text="Logs / Results",
+            font=("Segoe UI", 14, "bold"),
+            bg=self._tox_bg,
+            fg=self._tox_text,
+        ).pack(anchor="w", padx=18, pady=(10, 10))
+
+        logs_card = _RoundedCard(
+            body,
+            bg=self._tox_card_bg,
+            border=self._tox_border,
+            radius=12,
+            pad=(12, 12),
+            height=240,
+        )
+        logs_card.pack(fill="x", padx=18, pady=(0, 18))
+        logs_inner = logs_card.inner
+        self.result_text = tk.Text(
+            logs_inner,
+            height=11,
+            wrap="word",
+            bd=0,
+            padx=10,
+            pady=8,
+        )
+        logs_v = ttk.Scrollbar(logs_inner, orient="vertical", command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=logs_v.set)
+        self.result_text.grid(row=0, column=0, sticky="nsew")
+        logs_v.grid(row=0, column=1, sticky="ns")
+        logs_inner.rowconfigure(0, weight=1)
+        logs_inner.columnconfigure(0, weight=1)
+
     def _upload_toxicity_file(self) -> None:
         path = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[
+                ("Datasets", "*.csv *.xlsx *.xls *.json"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ]
         )
         if not path:
             return
+        p = Path(path)
+        self._dataset_path = p
+        self.file_var.set(p.name)
+
+        # If it's a dataset, load it and show in the shared Preview section.
+        if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}:
+            self._load_dataset_path(p)
+            return
+
+        # Otherwise treat it as analysis text input.
         try:
-            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            content = p.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             messagebox.showerror("Upload Error", str(exc))
             return
+        content = content.strip()
         self.tox_input.delete("1.0", END)
-        self.tox_input.insert("1.0", content.strip())
+        self.tox_input.insert("1.0", content)
+        self._show_text_preview(content)
 
     def _analyze_toxicity_text(self) -> None:
         text = self.tox_input.get("1.0", END).strip()
@@ -808,17 +823,16 @@ class ToxicCommentApp:
             ]
         )
         if path:
-            self.file_var.set(path)
+            p = Path(path)
+            self._dataset_path = p
+            self.file_var.set(p.name)
 
-    def _load_dataset(self) -> None:
-        raw_path = self.file_var.get().strip()
-        if not raw_path:
-            messagebox.showerror("Error", "Please browse file first.")
-            return
-        path = Path(raw_path)
+    def _load_dataset_path(self, path: Path) -> None:
         if not path.exists():
             messagebox.showerror("Error", "Please select a valid dataset file.")
             return
+        self._dataset_path = path
+        self.file_var.set(path.name)
         try:
             if path.suffix.lower() == ".csv":
                 df = pd.read_csv(path)
@@ -851,11 +865,31 @@ class ToxicCommentApp:
             self._log(f"Detected text column: {text_col}")
         if label_col:
             self._log(f"Detected label column: {label_col}")
-        # Main app goal: scan immediately after loading.
         self._scan_profanity()
 
+    def _load_dataset(self) -> None:
+        if self._dataset_path is None:
+            raw_path = self.file_var.get().strip()
+            if raw_path:
+                self._dataset_path = Path(raw_path)
+
+        if self._dataset_path is None:
+            messagebox.showerror("Error", "Please browse file first.")
+            return
+        self._load_dataset_path(self._dataset_path)
+
+    def _show_text_preview(self, text: str) -> None:
+        # Preview panel removed; show in analysis input instead.
+        if hasattr(self, "tox_input") and self.tox_input is not None:
+            self.tox_input.delete("1.0", END)
+            self.tox_input.insert("1.0", text)
+            self.tox_input.see("1.0")
+
     def _show_preview(self, df: pd.DataFrame) -> None:
-        self.preview_text.delete("1.0", END)
+        # Preview panel removed; show dataset preview inside the analysis input.
+        if not hasattr(self, "tox_input") or self.tox_input is None:
+            return
+        self.tox_input.delete("1.0", END)
         # Use TSV-style preview to avoid padded right-aligned DataFrame formatting.
         n_show = min(len(df), PREVIEW_MAX_ROWS)
         preview_df = df.head(n_show).fillna("").astype(str)
@@ -883,17 +917,9 @@ class ToxicCommentApp:
         if priority:
             preview_df = preview_df[priority + rest]
         preview_str = preview_df.to_csv(sep="\t", index=False)
-        self.preview_text.insert("1.0", preview_str, "left")
-        parent = self.preview_text.master.master
-        if isinstance(parent, ttk.LabelFrame):
-            if len(df) > n_show:
-                parent.configure(
-                    text=f"Dataset Preview (first {n_show:,} of {len(df):,} rows — scroll to view)"
-                )
-            else:
-                parent.configure(
-                    text=f"Dataset Preview ({len(df):,} rows — scroll to view)"
-                )
+        header = f"Dataset loaded: {len(df):,} rows, {len(df.columns):,} columns\n\n"
+        self.tox_input.insert("1.0", header + preview_str)
+        self.tox_input.see("1.0")
 
     def _detect_text_column(self, df: pd.DataFrame) -> str:
         object_cols = [c for c in df.columns if df[c].dtype == "object"]
@@ -1174,11 +1200,13 @@ class ToxicCommentApp:
         self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _on_preview_mousewheel(self, event: tk.Event) -> str:
-        self.preview_text.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # Preview panel removed
+        return "break"
         return "break"
 
     def _preview_text_focus_in(self, _event: tk.Event) -> None:
-        self.preview_text.focus_set()
+        # Preview panel removed
+        return
 
 
 def run() -> None:
