@@ -6,6 +6,7 @@ from pathlib import Path
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
+import colorsys
 
 import pandas as pd
 
@@ -15,6 +16,212 @@ from preprocessing import PreprocessConfig, TextPreprocessor
 
 # Max rows rendered in Dataset Preview (full file still loaded; raise if UI tolerates it).
 PREVIEW_MAX_ROWS = 50_000
+
+
+def _hsl_to_hex(h: float, s: float, l: float) -> str:
+    """
+    Convert HSL values (degrees, %, %) to #RRGGBB.
+
+    Tkinter mainly wants hex colors; design spec is provided as HSL.
+    """
+
+    h_norm = (h % 360.0) / 360.0
+    s_norm = max(0.0, min(1.0, s / 100.0))
+    l_norm = max(0.0, min(1.0, l / 100.0))
+    r, g, b = colorsys.hls_to_rgb(h_norm, l_norm, s_norm)
+    return f"#{int(round(r * 255)):02x}{int(round(g * 255)):02x}{int(round(b * 255)):02x}"
+
+
+def _draw_rounded_rect(
+    canvas: tk.Canvas,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    radius: int,
+    *,
+    fill: str,
+    outline: str,
+    width: int = 1,
+) -> int:
+    r = max(0, min(int(radius), int((x2 - x1) / 2), int((y2 - y1) / 2)))
+    points = [
+        x1 + r,
+        y1,
+        x2 - r,
+        y1,
+        x2,
+        y1,
+        x2,
+        y1 + r,
+        x2,
+        y2 - r,
+        x2,
+        y2,
+        x2 - r,
+        y2,
+        x1 + r,
+        y2,
+        x1,
+        y2,
+        x1,
+        y2 - r,
+        x1,
+        y1 + r,
+        x1,
+        y1,
+    ]
+    return int(
+        canvas.create_polygon(
+            points,
+            smooth=True,
+            splinesteps=36,
+            fill=fill,
+            outline=outline,
+            width=width,
+        )
+    )
+
+
+class _RoundedCard(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        bg: str,
+        border: str,
+        radius: int = 12,
+        border_width: int = 1,
+        pad: tuple[int, int] = (14, 14),
+        height: int | None = None,
+    ) -> None:
+        super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, bd=0)
+        self._card_bg = bg
+        self._border = border
+        self._radius = radius
+        self._border_width = border_width
+        self._padx, self._pady = pad
+        self._shape_id: int | None = None
+
+        if height is not None:
+            self.configure(height=height)
+
+        self.inner = tk.Frame(self, bg=self._card_bg)
+        self._inner_window = self.create_window(
+            (self._padx, self._pady),
+            window=self.inner,
+            anchor="nw",
+        )
+
+        self.bind("<Configure>", self._redraw)
+
+    def _redraw(self, _event: tk.Event) -> None:
+        w = max(1, int(self.winfo_width()))
+        h = max(1, int(self.winfo_height()))
+        self.delete("card_shape")
+        self._shape_id = _draw_rounded_rect(
+            self,
+            1,
+            1,
+            w - 1,
+            h - 1,
+            self._radius,
+            fill=self._card_bg,
+            outline=self._border,
+            width=self._border_width,
+        )
+        self.addtag_withtag("card_shape", self._shape_id)
+        self.tag_lower("card_shape")
+        self.coords(self._inner_window, self._padx, self._pady)
+        self.itemconfigure(
+            self._inner_window,
+            width=max(1, w - (self._padx * 2)),
+        )
+
+
+class _RoundedButton(tk.Canvas):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        text: str,
+        command: callable,
+        bg: str,
+        fg: str,
+        border: str | None = None,
+        radius: int = 12,
+        font: tuple[str, int, str] = ("Segoe UI", 10, "bold"),
+        padx: int = 18,
+        pady: int = 10,
+        hover_bg: str | None = None,
+        active_bg: str | None = None,
+    ) -> None:
+        super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
+        self._text = text
+        self._command = command
+        self._bg = bg
+        self._fg = fg
+        self._border = border or bg
+        self._radius = radius
+        self._font = font
+        self._padx = padx
+        self._pady = pady
+        self._hover_bg = hover_bg or bg
+        self._active_bg = active_bg or self._hover_bg
+
+        self._shape_id: int | None = None
+        self._text_id: int | None = None
+
+        self.bind("<Configure>", self._draw)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _draw(self, _event: tk.Event) -> None:
+        w = max(1, int(self.winfo_width()))
+        h = max(1, int(self.winfo_height()))
+        self.delete("all")
+        self._shape_id = _draw_rounded_rect(
+            self,
+            1,
+            1,
+            w - 1,
+            h - 1,
+            self._radius,
+            fill=self._bg,
+            outline=self._border,
+            width=1,
+        )
+        self._text_id = int(
+            self.create_text(
+                w // 2,
+                h // 2,
+                text=self._text,
+                fill=self._fg,
+                font=self._font,
+            )
+        )
+
+    def _set_bg(self, color: str) -> None:
+        if self._shape_id is not None:
+            self.itemconfigure(self._shape_id, fill=color)
+
+    def _on_enter(self, _event: tk.Event) -> None:
+        self._set_bg(self._hover_bg)
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        self._set_bg(self._bg)
+
+    def _on_click(self, _event: tk.Event) -> None:
+        self._set_bg(self._active_bg)
+        self.after(120, lambda: self._set_bg(self._hover_bg))
+        self._command()
+
+    def autosize(self) -> None:
+        # Approximate width based on text length (keeps layout stable without measuring fonts).
+        w = max(90, int(len(self._text) * 8 + (self._padx * 2)))
+        h = max(34, int(18 + (self._pady * 2)))
+        self.configure(width=w, height=h)
 
 
 class ToxicCommentApp:
@@ -254,7 +461,17 @@ class ToxicCommentApp:
             row=2, column=0, columnspan=2, sticky="we", pady=(8, 0)
         )
 
-        preview_frame = ttk.LabelFrame(right, text="Dataset Preview", padding=8)
+        # Right side: keep the existing preview/logs, but also add a "Toxicity Analysis"
+        # screen (matching the provided screenshot) as a second tab.
+        right_tabs = ttk.Notebook(right)
+        right_tabs.pack(fill="both", expand=True)
+
+        tab_dataset = ttk.Frame(right_tabs, padding=0)
+        tab_toxicity = ttk.Frame(right_tabs, padding=0)
+        right_tabs.add(tab_dataset, text="Preview / Logs")
+        right_tabs.add(tab_toxicity, text="Toxicity Analysis")
+
+        preview_frame = ttk.LabelFrame(tab_dataset, text="Dataset Preview", padding=8)
         preview_frame.pack(fill="both", expand=True)
         preview_grid = ttk.Frame(preview_frame)
         preview_grid.pack(fill="both", expand=True)
@@ -267,15 +484,9 @@ class ToxicCommentApp:
             padx=20,
         )
         self.preview_text.tag_configure("left", justify="left")
-        preview_v = ttk.Scrollbar(
-            preview_grid, orient="vertical", command=self.preview_text.yview
-        )
-        preview_h = ttk.Scrollbar(
-            preview_grid, orient="horizontal", command=self.preview_text.xview
-        )
-        self.preview_text.configure(
-            yscrollcommand=preview_v.set, xscrollcommand=preview_h.set
-        )
+        preview_v = ttk.Scrollbar(preview_grid, orient="vertical", command=self.preview_text.yview)
+        preview_h = ttk.Scrollbar(preview_grid, orient="horizontal", command=self.preview_text.xview)
+        self.preview_text.configure(yscrollcommand=preview_v.set, xscrollcommand=preview_h.set)
         self.preview_text.grid(row=0, column=0, sticky="nsew")
         preview_v.grid(row=0, column=1, sticky="ns")
         preview_h.grid(row=1, column=0, sticky="ew")
@@ -284,10 +495,278 @@ class ToxicCommentApp:
         self.preview_text.bind("<MouseWheel>", self._on_preview_mousewheel)
         self.preview_text.bind("<Enter>", self._preview_text_focus_in)
 
-        result_frame = ttk.LabelFrame(right, text="Logs / Results", padding=8)
+        result_frame = ttk.LabelFrame(tab_dataset, text="Logs / Results", padding=8)
         result_frame.pack(fill="both", expand=True, pady=(10, 0))
         self.result_text = tk.Text(result_frame, height=16, wrap="word")
         self.result_text.pack(fill="both", expand=True)
+
+        self._build_toxicity_tab(tab_toxicity)
+
+    def _build_toxicity_tab(self, parent: ttk.Frame) -> None:
+        # Design colors (from user spec)
+        self._tox_blue = _hsl_to_hex(221, 83, 53)  # Analyze button
+        self._tox_green = _hsl_to_hex(142, 71, 45)  # Low toxicity accent/text
+        # Light background for the overall card (use same hue but much lighter)
+        self._tox_green_bg = _hsl_to_hex(142, 71, 95)
+        self._tox_border = "#e5e7eb"
+        self._tox_text = "#111827"
+        self._tox_muted = "#6b7280"
+        self._tox_bg = "#f9fafb"
+        self._tox_card_bg = "#ffffff"
+
+        canvas = tk.Canvas(parent, bg=self._tox_bg, highlightthickness=0)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        body = tk.Frame(canvas, bg=self._tox_bg)
+        canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def on_body_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        body.bind("<Configure>", on_body_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        # Title
+        tk.Label(
+            body,
+            text="Toxicity Analysis",
+            font=("Segoe UI", 20, "bold"),
+            bg=self._tox_bg,
+            fg=self._tox_text,
+        ).pack(pady=(18, 4))
+        tk.Label(
+            body,
+            text="Enter a comment or upload a file to analyze for toxic content",
+            font=("Segoe UI", 10),
+            bg=self._tox_bg,
+            fg=self._tox_muted,
+        ).pack(pady=(0, 14))
+
+        # Input card
+        input_card = _RoundedCard(body, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(14, 14))
+        input_card.pack(fill="x", padx=18, pady=(0, 16))
+        input_card_inner = input_card.inner
+
+        self.tox_input = tk.Text(
+            input_card_inner,
+            height=6,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=self._tox_border,
+            highlightcolor=self._tox_border,
+            padx=10,
+            pady=10,
+        )
+        self.tox_input.pack(fill="x")
+
+        actions = tk.Frame(input_card_inner, bg=self._tox_card_bg)
+        actions.pack(fill="x", pady=(12, 0))
+        actions.columnconfigure(0, weight=1)
+
+        self.analyze_btn = _RoundedButton(
+            actions,
+            text="Analyze",
+            bg=self._tox_blue,
+            fg="#ffffff",
+            command=self._analyze_toxicity_text,
+            border=self._tox_blue,
+            radius=12,
+            hover_bg=self._tox_blue,
+            active_bg=self._tox_blue,
+        )
+        self.analyze_btn.autosize()
+        self.analyze_btn.grid(row=0, column=0, sticky="we", padx=(0, 10))
+
+        self.upload_btn = _RoundedButton(
+            actions,
+            text="Upload File",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._upload_toxicity_file,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
+        )
+        self.upload_btn.autosize()
+        self.upload_btn.grid(row=0, column=1, sticky="e")
+
+        # Results header
+        tk.Label(
+            body,
+            text="Analysis Results",
+            font=("Segoe UI", 14, "bold"),
+            bg=self._tox_bg,
+            fg=self._tox_text,
+        ).pack(anchor="w", padx=18, pady=(8, 10))
+
+        # Overall card (green)
+        overall = _RoundedCard(body, bg=self._tox_green_bg, border=self._tox_border, radius=12, pad=(0, 0))
+        overall.pack(fill="x", padx=18, pady=(0, 14))
+        overall_inner = overall.inner
+
+        tk.Label(
+            overall_inner,
+            text="Overall Toxicity Score",
+            font=("Segoe UI", 10),
+            bg=self._tox_green_bg,
+            fg=self._tox_muted,
+        ).pack(pady=(14, 2))
+
+        self.overall_pct_label = tk.Label(
+            overall_inner,
+            text="0%",
+            font=("Segoe UI", 36, "bold"),
+            bg=self._tox_green_bg,
+            fg=self._tox_green,
+        )
+        self.overall_pct_label.pack()
+
+        self.overall_badge = tk.Label(
+            overall_inner,
+            text="Low Toxicity",
+            font=("Segoe UI", 10, "bold"),
+            bg=self._tox_green_bg,
+            fg=self._tox_green,
+            padx=12,
+            pady=4,
+        )
+        self.overall_badge.pack(pady=(4, 14))
+
+        # Metric cards (2 rows x 3)
+        metrics_wrap = tk.Frame(body, bg=self._tox_bg)
+        metrics_wrap.pack(fill="x", padx=18, pady=(0, 18))
+        for c in range(3):
+            metrics_wrap.columnconfigure(c, weight=1, uniform="m")
+
+        self.metric_widgets: dict[str, dict[str, object]] = {}
+        metric_defs = [
+            ("Toxicity", "Overall toxicity indicators"),
+            ("Severe Toxicity", "Extreme toxic content signals"),
+            ("Identity Attack", "Identity-based attack signals"),
+            ("Insult", "Insulting or demeaning language signals"),
+            ("Profanity", "Profanity usage signals"),
+            ("Threat", "Threat-related signals"),
+        ]
+
+        for idx, (title, subtitle) in enumerate(metric_defs):
+            r, c = divmod(idx, 3)
+            card = _RoundedCard(metrics_wrap, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(12, 12))
+            card.grid(row=r, column=c, sticky="nsew", padx=8, pady=8)
+            inner = card.inner
+
+            header = tk.Frame(inner, bg=self._tox_card_bg)
+            header.pack(fill="x")
+            tk.Label(header, text=title, font=("Segoe UI", 10, "bold"), bg=self._tox_card_bg, fg=self._tox_text).pack(
+                side="left"
+            )
+            pct = tk.Label(header, text="0%", font=("Segoe UI", 10, "bold"), bg=self._tox_card_bg, fg=self._tox_green)
+            pct.pack(side="right")
+
+            bar_outer = tk.Frame(inner, bg="#eef2f7")
+            bar_outer.pack(fill="x", pady=(10, 10))
+            bar_fill = tk.Frame(bar_outer, bg=self._tox_green, width=0, height=6)
+            bar_fill.pack(side="left", fill="y")
+            bar_outer.pack_propagate(False)
+            bar_outer.configure(height=6)
+
+            tk.Label(inner, text=subtitle, font=("Segoe UI", 9), bg=self._tox_card_bg, fg=self._tox_muted).pack(
+                anchor="w"
+            )
+
+            self.metric_widgets[title] = {"pct": pct, "bar_outer": bar_outer, "bar_fill": bar_fill}
+
+    def _upload_toxicity_file(self) -> None:
+        path = filedialog.askopenfilename(
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            messagebox.showerror("Upload Error", str(exc))
+            return
+        self.tox_input.delete("1.0", END)
+        self.tox_input.insert("1.0", content.strip())
+
+    def _analyze_toxicity_text(self) -> None:
+        text = self.tox_input.get("1.0", END).strip()
+        if not text:
+            messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
+            return
+
+        try:
+            # Heuristic scoring using existing profanity scanner signals (keeps UI responsive).
+            # This is strictly for the preview panel design; you can swap it with your model API later.
+            scan = self.profanity_scanner.scan_text(text)
+            prof = int(scan.profanity_count)
+            toxic = min(100, prof * 15)
+            severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
+            identity = 0
+            insult = min(100, prof * 6)
+            profanity = min(100, prof * 20)
+            threat = 0
+
+            metrics = {
+                "Toxicity": toxic,
+                "Severe Toxicity": severe,
+                "Identity Attack": identity,
+                "Insult": insult,
+                "Profanity": profanity,
+                "Threat": threat,
+            }
+            overall = int(round(sum(metrics.values()) / len(metrics)))
+
+            self._update_toxicity_ui(overall=overall, metrics=metrics)
+
+            summary = (
+                "Toxicity Analysis Result\n"
+                f"- Overall: {overall}%\n"
+                f"- Toxicity: {toxic}%\n"
+                f"- Severe Toxicity: {severe}%\n"
+                f"- Identity Attack: {identity}%\n"
+                f"- Insult: {insult}%\n"
+                f"- Profanity: {profanity}%\n"
+                f"- Threat: {threat}%"
+            )
+            self._log(summary)
+        except Exception as exc:
+            messagebox.showerror("Analyze Error", str(exc))
+            self._log(f"Analyze Error: {exc}")
+            return
+
+    def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
+        overall = max(0, min(100, int(overall)))
+        self.overall_pct_label.configure(text=f"{overall}%")
+        label = "Low Toxicity" if overall < 35 else ("Medium Toxicity" if overall < 70 else "High Toxicity")
+        self.overall_badge.configure(text=label)
+
+        # Update metric cards + bars
+        for title, value in metrics.items():
+            w = self.metric_widgets.get(title)
+            if not w:
+                continue
+            v = max(0, min(100, int(value)))
+            pct_label: tk.Label = w["pct"]  # type: ignore[assignment]
+            pct_label.configure(text=f"{v}%")
+
+            outer: tk.Frame = w["bar_outer"]  # type: ignore[assignment]
+            fill: tk.Frame = w["bar_fill"]  # type: ignore[assignment]
+
+            # Ensure geometry is computed before sizing the fill.
+            outer.update_idletasks()
+            width = max(1, int(outer.winfo_width()))
+            fill_w = int(width * (v / 100.0))
+            fill.configure(width=fill_w)
 
     def _browse_file(self) -> None:
         path = filedialog.askopenfilename(
