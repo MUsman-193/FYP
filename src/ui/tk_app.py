@@ -353,15 +353,18 @@ class ToxicCommentApp:
         preview_df = preview_df.apply(
             lambda col: col.str.replace("\n", "\\n", regex=False).str.replace("\t", " ", regex=False)
         )
+        # Hide profanity scan columns from preview (keep them in self.df).
+        profanity_cols = ["has_profanity", "profanity_count", "profanity_matches"]
+        drop_cols = [c for c in profanity_cols if c in preview_df.columns]
+        if drop_cols:
+            preview_df = preview_df.drop(columns=drop_cols)
+
         cols = list(preview_df.columns)
         text_col = self.text_col_var.get().strip()
         priority: list[str] = []
         if text_col and text_col in cols:
             priority.append(text_col)
         for name in ("processed_text", "augmented_text"):
-            if name in cols and name not in priority:
-                priority.append(name)
-        for name in ("has_profanity", "profanity_count", "profanity_matches"):
             if name in cols and name not in priority:
                 priority.append(name)
         for name in ("clean_text", "clean_replacements"):

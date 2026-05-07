@@ -25,8 +25,11 @@ class ProfanitySanitizer:
     def __init__(self, terms: Iterable[str]) -> None:
         cleaned = sorted({t.strip().lower() for t in terms if t and t.strip()})
         self._terms = cleaned
+        # Match whole words, plus common inflections so "fuck" catches "fucking", etc.
+        suffix = r"(?:'s|s|es|ed|ing|er|ers|y|ies)?"
         self._direct = re.compile(
-            r"\b(" + "|".join(re.escape(t) for t in cleaned) + r")\b", flags=re.IGNORECASE
+            r"\b(" + "|".join(re.escape(t) for t in cleaned) + r")" + suffix + r"\b",
+            flags=re.IGNORECASE,
         )
         # Obfuscation: letters separated by non-word chars/underscores/spaces.
         self._obfuscated: list[tuple[str, re.Pattern[str]]] = [
@@ -70,9 +73,9 @@ class ProfanitySanitizer:
 
         # Pass 1: direct.
         def _direct_sub(m: re.Match[str]) -> str:
-            term = m.group(1)
-            replacements.append(term.lower())
-            return repl_for(term)
+            base = m.group(1)
+            replacements.append(base.lower())
+            return repl_for(base)
 
         out = self._direct.sub(_direct_sub, out)
 

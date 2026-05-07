@@ -32,6 +32,7 @@ class ProfanityScanner:
         "bitch",
         "bullshit",
         "crap",
+        "cunt",
         "damn",
         "dick",
         "fuck",
@@ -61,8 +62,12 @@ class ProfanityScanner:
         cleaned = sorted({t.strip().lower() for t in base_terms if t and t.strip()})
         self._terms = cleaned
         # Word boundary helps avoid matching substrings (e.g., "ass" in "class").
+        # Also match common inflections so "fuck" catches "fucking", "bitch" catches "bitches", etc.
         escaped = [re.escape(t) for t in cleaned]
-        self._pattern = re.compile(r"\b(" + "|".join(escaped) + r")\b", flags=re.IGNORECASE)
+        suffix = r"(?:'s|s|es|ed|ing|er|ers|y|ies)?"
+        self._pattern = re.compile(
+            r"\b(" + "|".join(escaped) + r")" + suffix + r"\b", flags=re.IGNORECASE
+        )
 
     @property
     def terms(self) -> List[str]:
