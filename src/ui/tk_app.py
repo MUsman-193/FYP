@@ -520,6 +520,8 @@ class ToxicCommentApp:
         scrollbar.pack(side="right", fill="y")
         canvas.configure(yscrollcommand=scrollbar.set)
 
+        # Keep content centered with a max width to create left/right whitespace on wide windows.
+        self._tox_max_width = 1000
         body = tk.Frame(canvas, bg=self._tox_bg)
         canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
 
@@ -527,7 +529,11 @@ class ToxicCommentApp:
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def on_canvas_configure(event: tk.Event) -> None:
-            canvas.itemconfigure(canvas_window, width=event.width)
+            available = max(1, int(event.width))
+            content_w = min(available, int(self._tox_max_width))
+            x = max(0, int((available - content_w) / 2))
+            canvas.itemconfigure(canvas_window, width=content_w)
+            canvas.coords(canvas_window, x, 0)
 
         body.bind("<Configure>", on_body_configure)
         canvas.bind("<Configure>", on_canvas_configure)
@@ -599,17 +605,26 @@ class ToxicCommentApp:
         self.upload_btn.autosize()
         self.upload_btn.grid(row=0, column=1, sticky="e")
 
-        # Results header
+        # Results area (HIDDEN until user clicks Analyze)
+        self._tox_results_wrap = tk.Frame(body, bg=self._tox_bg)
+
         tk.Label(
-            body,
+            self._tox_results_wrap,
             text="Analysis Results",
             font=("Segoe UI", 14, "bold"),
             bg=self._tox_bg,
             fg=self._tox_text,
         ).pack(anchor="w", padx=18, pady=(8, 10))
 
-        # Overall card (green)
-        overall = _RoundedCard(body, bg=self._tox_green_bg, border=self._tox_border, radius=12, pad=(0, 0))
+        # Overall card (green) - fixed height for consistent layout
+        overall = _RoundedCard(
+            self._tox_results_wrap,
+            bg=self._tox_green_bg,
+            border=self._tox_border,
+            radius=12,
+            pad=(0, 0),
+            height=170,
+        )
         overall.pack(fill="x", padx=18, pady=(0, 14))
         overall_inner = overall.inner
 
@@ -619,7 +634,7 @@ class ToxicCommentApp:
             font=("Segoe UI", 10),
             bg=self._tox_green_bg,
             fg=self._tox_muted,
-        ).pack(pady=(14, 2))
+        ).pack(pady=(18, 2))
 
         self.overall_pct_label = tk.Label(
             overall_inner,
@@ -639,10 +654,10 @@ class ToxicCommentApp:
             padx=12,
             pady=4,
         )
-        self.overall_badge.pack(pady=(4, 14))
+        self.overall_badge.pack(pady=(4, 18))
 
         # Metric cards (2 rows x 3)
-        metrics_wrap = tk.Frame(body, bg=self._tox_bg)
+        metrics_wrap = tk.Frame(self._tox_results_wrap, bg=self._tox_bg)
         metrics_wrap.pack(fill="x", padx=18, pady=(0, 18))
         for c in range(3):
             metrics_wrap.columnconfigure(c, weight=1, uniform="m")
@@ -659,7 +674,14 @@ class ToxicCommentApp:
 
         for idx, (title, subtitle) in enumerate(metric_defs):
             r, c = divmod(idx, 3)
-            card = _RoundedCard(metrics_wrap, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(12, 12))
+            card = _RoundedCard(
+                metrics_wrap,
+                bg=self._tox_card_bg,
+                border=self._tox_border,
+                radius=12,
+                pad=(12, 12),
+                height=140,
+            )
             card.grid(row=r, column=c, sticky="nsew", padx=8, pady=8)
             inner = card.inner
 
@@ -684,6 +706,9 @@ class ToxicCommentApp:
 
             self.metric_widgets[title] = {"pct": pct, "bar_outer": bar_outer, "bar_fill": bar_fill}
 
+        # Keep results hidden until first Analyze click
+        self._tox_results_visible = False
+
     def _upload_toxicity_file(self) -> None:
         path = filedialog.askopenfilename(
             filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
@@ -705,6 +730,11 @@ class ToxicCommentApp:
             return
 
         try:
+            if not getattr(self, "_tox_results_visible", False):
+                # Show results UI only when analysis actually runs.
+                self._tox_results_wrap.pack(fill="x", pady=(0, 6))
+                self._tox_results_visible = True
+
             # Heuristic scoring using existing profanity scanner signals (keeps UI responsive).
             # This is strictly for the preview panel design; you can swap it with your model API later.
             scan = self.profanity_scanner.scan_text(text)
