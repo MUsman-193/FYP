@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import os
-import threading
-import time
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
@@ -14,13 +11,7 @@ import colorsys
 import pandas as pd
 
 from augmentation import AugmentConfig, TextAugmenter
-from moderation import (
-    OfflineFallbackRewriter,
-    OpenAIModerator,
-    OpenAITextRewriter,
-    ProfanitySanitizer,
-    ProfanityScanner,
-)
+from moderation import ProfanitySanitizer, ProfanityScanner
 from preprocessing import PreprocessConfig, TextPreprocessor
 
 # Max rows rendered in Dataset Preview (full file still loaded; raise if UI tolerates it).
@@ -286,8 +277,6 @@ class ToxicCommentApp:
         self.augmenter = TextAugmenter(seed=42)
         self.profanity_scanner = ProfanityScanner()
         self.profanity_sanitizer = ProfanitySanitizer(self.profanity_scanner.terms)
-        self._moderator: OpenAIModerator | None = None
-        self._rewriter = None
         self.model_manager = None
         self._modeling_available = False
         self._modeling_error: str | None = None
@@ -656,20 +645,6 @@ class ToxicCommentApp:
             fg=self._tox_muted,
         ).pack(pady=(0, 14))
 
-        status_row = tk.Frame(body, bg=self._tox_bg)
-        status_row.pack(fill="x", padx=18, pady=(0, 10))
-        self._tox_status_var = tk.StringVar(value="Ready")
-        tk.Label(
-            status_row,
-            textvariable=self._tox_status_var,
-            font=("Segoe UI", 10, "bold"),
-            bg=self._tox_bg,
-            fg=self._tox_muted,
-        ).pack(side="left")
-        self._tox_progress = ttk.Progressbar(status_row, mode="indeterminate", length=180)
-        self._tox_progress.pack(side="right")
-        self._tox_progress.stop()
-
         # Toxicity analysis section (analysis shown above Logs/Results)
         tk.Label(
             body,
@@ -730,38 +705,6 @@ class ToxicCommentApp:
         self.upload_btn.autosize()
         self.upload_btn.grid(row=0, column=1, sticky="e")
 
-        batch_row = tk.Frame(input_card_inner, bg=self._tox_card_bg)
-        batch_row.pack(fill="x", pady=(10, 0))
-        batch_row.columnconfigure(0, weight=1)
-
-        self.batch_btn = _RoundedButton(
-            batch_row,
-            text="Analyze Dataset Column",
-            bg="#ffffff",
-            fg=self._tox_text,
-            command=self._analyze_dataset_column,
-            border=self._tox_border,
-            radius=12,
-            hover_bg="#f3f4f6",
-            active_bg="#e5e7eb",
-        )
-        self.batch_btn.autosize()
-        self.batch_btn.grid(row=0, column=0, sticky="w")
-
-        self.export_results_btn = _RoundedButton(
-            batch_row,
-            text="Export Results CSV",
-            bg="#ffffff",
-            fg=self._tox_text,
-            command=self._export_moderation_results,
-            border=self._tox_border,
-            radius=12,
-            hover_bg="#f3f4f6",
-            active_bg="#e5e7eb",
-        )
-        self.export_results_btn.autosize()
-        self.export_results_btn.grid(row=0, column=1, sticky="e")
-
         # Results area (HIDDEN until user clicks Analyze)
         self._tox_results_wrap = tk.Frame(body, bg=self._tox_bg)
 
@@ -813,26 +756,24 @@ class ToxicCommentApp:
         )
         self.overall_badge.pack(pady=(4, 18))
 
-        # Metric cards (2 rows x 4)
+        # Metric cards (2 rows x 3)
         metrics_wrap = tk.Frame(self._tox_results_wrap, bg=self._tox_bg)
         metrics_wrap.pack(fill="x", padx=18, pady=(0, 18))
-        for c in range(4):
+        for c in range(3):
             metrics_wrap.columnconfigure(c, weight=1, uniform="m")
 
         self.metric_widgets: dict[str, dict[str, object]] = {}
         metric_defs = [
-            ("Harassment", "Harassment / bullying"),
-            ("Hate Speech", "Hate / identity attacks"),
-            ("Insults", "Demeaning language"),
-            ("Threats", "Threat content"),
-            ("Profanity", "Offline profanity scan"),
-            ("Sexual Content", "Sexual content"),
-            ("Violence", "Violence / graphic"),
-            ("Self-harm", "Self-harm / intent"),
+            ("Toxicity", "Overall toxicity indicators"),
+            ("Severe Toxicity", "Extreme toxic content signals"),
+            ("Identity Attack", "Identity-based attack signals"),
+            ("Insult", "Insulting or demeaning language signals"),
+            ("Profanity", "Profanity usage signals"),
+            ("Threat", "Threat-related signals"),
         ]
 
         for idx, (title, subtitle) in enumerate(metric_defs):
-            r, c = divmod(idx, 4)
+            r, c = divmod(idx, 3)
             card = _RoundedCard(
                 metrics_wrap,
                 bg=self._tox_card_bg,
@@ -864,44 +805,6 @@ class ToxicCommentApp:
             )
 
             self.metric_widgets[title] = {"pct": pct, "bar_outer": bar_outer, "bar_fill": bar_fill}
-
-        # Side-by-side original vs sanitized
-        tk.Label(
-            self._tox_results_wrap,
-            text="Original vs Sanitized",
-            font=("Segoe UI", 14, "bold"),
-            bg=self._tox_bg,
-            fg=self._tox_text,
-        ).pack(anchor="w", padx=18, pady=(0, 10))
-
-        compare_wrap = tk.Frame(self._tox_results_wrap, bg=self._tox_bg)
-        compare_wrap.pack(fill="both", padx=18, pady=(0, 18))
-        compare_wrap.columnconfigure(0, weight=1, uniform="cmp")
-        compare_wrap.columnconfigure(1, weight=1, uniform="cmp")
-
-        def _text_card(parent: tk.Misc, title: str) -> tuple[_RoundedCard, tk.Text]:
-            card = _RoundedCard(
-                parent,
-                bg=self._tox_card_bg,
-                border=self._tox_border,
-                radius=12,
-                pad=(12, 12),
-                height=220,
-            )
-            inner = card.inner
-            tk.Label(inner, text=title, font=("Segoe UI", 10, "bold"), bg=self._tox_card_bg, fg=self._tox_text).pack(
-                anchor="w", pady=(0, 8)
-            )
-            t = tk.Text(inner, height=8, wrap="word", bd=0, padx=10, pady=8)
-            t.pack(fill="both", expand=True)
-            return card, t
-
-        left_card, self._tox_original_text = _text_card(compare_wrap, "Original (toxic highlights)")
-        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        right_card, self._tox_clean_text = _text_card(compare_wrap, "Sanitized (polite rewrite)")
-        right_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-
-        self._tox_original_text.tag_configure("toxic", background="#fee2e2", foreground="#991b1b")
 
         # Keep results hidden until first Analyze click
         self._tox_results_visible = False
@@ -970,230 +873,55 @@ class ToxicCommentApp:
         self.tox_input.insert("1.0", content)
         self._show_text_preview(content)
 
-        # If it's a TXT with multiple lines, also offer it as a batch dataset (one row per line).
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-        if len(lines) >= 2:
-            self.df = pd.DataFrame({"text": lines})
-            cols = list(self.df.columns.astype(str))
-            self.text_col_combo["values"] = cols
-            self.label_col_combo["values"] = cols
-            self.text_col_var.set("text")
-            self.label_col_var.set("")
-            self._show_preview(self.df)
-            self._log(f"Loaded TXT as dataset with shape: {self.df.shape} (column: text)")
-
-    def _ensure_services(self) -> None:
-        if self._moderator is None:
-            self._moderator = OpenAIModerator(
-                api_key=os.environ.get("OPENAI_API_KEY"),
-                model=os.environ.get("OPENAI_MODERATION_MODEL", "omni-moderation-latest"),
-            )
-        if self._rewriter is None:
-            if os.environ.get("OPENAI_API_KEY", "").strip():
-                self._rewriter = OpenAITextRewriter(
-                    api_key=os.environ.get("OPENAI_API_KEY"),
-                    model=os.environ.get("OPENAI_REWRITE_MODEL", "gpt-4.1-mini"),
-                )
-            else:
-                self._rewriter = OfflineFallbackRewriter()
-
-    def _set_busy(self, busy: bool, msg: str | None = None) -> None:
-        if msg is not None and hasattr(self, "_tox_status_var"):
-            self._tox_status_var.set(msg)
-        if busy:
-            if hasattr(self, "_tox_progress"):
-                self._tox_progress.start(12)
-            self.analyze_btn.set_enabled(False)
-            self.upload_btn.set_enabled(False)
-            self.batch_btn.set_enabled(False)
-            self.export_results_btn.set_enabled(False)
-        else:
-            if hasattr(self, "_tox_progress"):
-                self._tox_progress.stop()
-            self.analyze_btn.set_enabled(True)
-            self.upload_btn.set_enabled(True)
-            self.batch_btn.set_enabled(True)
-            self.export_results_btn.set_enabled(True)
-
     def _analyze_toxicity_text(self) -> None:
         text = self.tox_input.get("1.0", END).strip()
         if not text:
             messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
             return
 
-        if not getattr(self, "_tox_results_visible", False):
-            self._tox_results_wrap.pack(fill="x", pady=(0, 6))
-            self._tox_results_visible = True
-
-        self._set_busy(True, "Analyzing with OpenAI Moderation…")
-
-        def work() -> None:
-            started = time.time()
-            try:
-                self._ensure_services()
-                assert self._moderator is not None
-                mod = self._moderator.moderate_text(text)
-
-                scan = self.profanity_scanner.scan_text(text)
-                profanity_score = 1.0 if scan.has_profanity else 0.0
-
-                cat = {c.name: c.score for c in mod.categories}
-                metrics = {
-                    "Harassment": int(round(100 * float(cat.get("harassment", 0.0)))),
-                    "Hate Speech": int(round(100 * float(cat.get("hate_speech", 0.0)))),
-                    "Insults": int(round(100 * float(cat.get("insults", 0.0)))),
-                    "Threats": int(round(100 * float(cat.get("threats", 0.0)))),
-                    "Profanity": int(round(100 * profanity_score)),
-                    "Sexual Content": int(round(100 * float(cat.get("sexual_content", 0.0)))),
-                    "Violence": int(round(100 * float(cat.get("violence", 0.0)))),
-                    "Self-harm": int(round(100 * float(cat.get("self_harm", 0.0)))),
-                }
-                overall = int(round(100 * max(mod.toxicity_score, profanity_score)))
-
-                cleaned = text
-                if mod.flagged or scan.has_profanity:
-                    self._set_busy(True, "Toxic detected — generating polite rewrite…")
-                    cleaned = self._rewriter.rewrite_polite(text).clean_text  # type: ignore[union-attr]
-
-                elapsed = time.time() - started
-
-                def done() -> None:
-                    self._update_toxicity_ui(overall=overall, metrics=metrics)
-                    self._render_original_and_clean(text, cleaned, scan.matches)
-
-                    detected = [k for k, v in metrics.items() if v >= 50 and k != "Profanity"]
-                    if scan.has_profanity:
-                        detected.append("Profanity")
-                    status = "TOXIC" if (mod.flagged or scan.has_profanity) else "CLEAN"
-                    self._log(
-                        "Toxicity Analysis Result (OpenAI Moderation)\n"
-                        f"- Status: {status}\n"
-                        f"- Overall toxicity: {overall}%\n"
-                        f"- Detected categories: {', '.join(detected) if detected else 'None'}\n"
-                        f"- Time: {elapsed:.2f}s"
-                    )
-                    self._set_busy(False, "Ready")
-
-                self.root.after(0, done)
-            except Exception as exc:
-                def fail() -> None:
-                    messagebox.showerror("Analyze Error", str(exc))
-                    self._log(f"Analyze Error: {exc}")
-                    self._set_busy(False, "Ready")
-
-                self.root.after(0, fail)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _render_original_and_clean(self, original: str, cleaned: str, toxic_terms: list[str]) -> None:
-        self._tox_original_text.configure(state="normal")
-        self._tox_clean_text.configure(state="normal")
-        self._tox_original_text.delete("1.0", END)
-        self._tox_clean_text.delete("1.0", END)
-        self._tox_original_text.insert("1.0", original)
-        self._tox_clean_text.insert("1.0", cleaned)
-
-        self._tox_original_text.tag_remove("toxic", "1.0", END)
-        for term in toxic_terms:
-            if not term:
-                continue
-            start = "1.0"
-            while True:
-                idx = self._tox_original_text.search(term, start, stopindex=END, nocase=True)
-                if not idx:
-                    break
-                end = f"{idx}+{len(term)}c"
-                self._tox_original_text.tag_add("toxic", idx, end)
-                start = end
-
-        self._tox_original_text.configure(state="disabled")
-        self._tox_clean_text.configure(state="disabled")
-
-    def _analyze_dataset_column(self) -> None:
-        if self.df is None:
-            messagebox.showerror("Batch Analyze Error", "Load a dataset first (CSV/XLSX/JSON).")
-            return
-
-        col = self._training_text_column()
-        if col not in self.df.columns:
-            col = self.text_col_var.get().strip()
-        if col not in self.df.columns:
-            messagebox.showerror("Batch Analyze Error", "Please select a valid text column.")
-            return
-
-        texts = self.df[col].astype(str).tolist()
-        if not texts:
-            messagebox.showerror("Batch Analyze Error", "Dataset is empty.")
-            return
-
-        self._set_busy(True, f"Batch moderating {len(texts):,} rows…")
-
-        def work() -> None:
-            try:
-                self._ensure_services()
-                assert self._moderator is not None
-                results = self._moderator.moderate_texts(texts, batch_size=32)
-                scans = self.profanity_scanner.scan_texts(texts)
-
-                self.df["oai_flagged"] = [r.flagged for r in results]
-                self.df["oai_toxicity_score"] = [round(r.toxicity_score, 6) for r in results]
-                self.df["has_profanity"] = [s.has_profanity for s in scans]
-                self.df["profanity_matches"] = [", ".join(s.matches) for s in scans]
-
-                def score_for(r, name: str) -> float:
-                    for c in r.categories:
-                        if c.name == name:
-                            return float(c.score)
-                    return 0.0
-
-                self.df["score_harassment"] = [round(score_for(r, "harassment"), 6) for r in results]
-                self.df["score_hate_speech"] = [round(score_for(r, "hate_speech"), 6) for r in results]
-                self.df["score_insults"] = [round(score_for(r, "insults"), 6) for r in results]
-                self.df["score_threats"] = [round(score_for(r, "threats"), 6) for r in results]
-                self.df["score_sexual_content"] = [round(score_for(r, "sexual_content"), 6) for r in results]
-                self.df["score_violence"] = [round(score_for(r, "violence"), 6) for r in results]
-                self.df["score_self_harm"] = [round(score_for(r, "self_harm"), 6) for r in results]
-
-                flagged = int(sum(bool(x) for x in self.df["oai_flagged"].tolist()))
-                total = int(len(self.df))
-                pct = (flagged / total * 100.0) if total else 0.0
-
-                def done() -> None:
-                    self._show_preview(self.df)
-                    self._log(f"Batch moderation completed on column: {col}")
-                    self._log(f"Toxic rows (OpenAI flagged): {flagged:,} / {total:,} ({pct:.2f}%)")
-                    self._set_busy(False, "Ready")
-
-                self.root.after(0, done)
-            except Exception as exc:
-                def fail() -> None:
-                    messagebox.showerror("Batch Analyze Error", str(exc))
-                    self._log(f"Batch Analyze Error: {exc}")
-                    self._set_busy(False, "Ready")
-
-                self.root.after(0, fail)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _export_moderation_results(self) -> None:
-        if self.df is None:
-            messagebox.showerror("Export Error", "No dataset loaded.")
-            return
-        if "oai_toxicity_score" not in self.df.columns:
-            messagebox.showerror("Export Error", "Run 'Analyze Dataset Column' first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
-            return
         try:
-            self.df.to_csv(path, index=False)
+            if not getattr(self, "_tox_results_visible", False):
+                # Show results UI only when analysis actually runs.
+                self._tox_results_wrap.pack(fill="x", pady=(0, 6))
+                self._tox_results_visible = True
+
+            # Heuristic scoring using existing profanity scanner signals (keeps UI responsive).
+            scan = self.profanity_scanner.scan_text(text)
+            prof = int(scan.profanity_count)
+            toxic = min(100, prof * 15)
+            severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
+            identity = 0
+            insult = min(100, prof * 6)
+            profanity = min(100, prof * 20)
+            threat = 0
+
+            metrics = {
+                "Toxicity": toxic,
+                "Severe Toxicity": severe,
+                "Identity Attack": identity,
+                "Insult": insult,
+                "Profanity": profanity,
+                "Threat": threat,
+            }
+            overall = int(round(sum(metrics.values()) / len(metrics)))
+
+            self._update_toxicity_ui(overall=overall, metrics=metrics)
+
+            summary = (
+                "Toxicity Analysis Result\n"
+                f"- Overall: {overall}%\n"
+                f"- Toxicity: {toxic}%\n"
+                f"- Severe Toxicity: {severe}%\n"
+                f"- Identity Attack: {identity}%\n"
+                f"- Insult: {insult}%\n"
+                f"- Profanity: {profanity}%\n"
+                f"- Threat: {threat}%"
+            )
+            self._log(summary)
         except Exception as exc:
-            messagebox.showerror("Export Error", str(exc))
+            messagebox.showerror("Analyze Error", str(exc))
+            self._log(f"Analyze Error: {exc}")
             return
-        self._log(f"Exported moderation results to: {path}")
 
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
         overall = max(0, min(100, int(overall)))
