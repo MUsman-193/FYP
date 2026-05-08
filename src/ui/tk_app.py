@@ -6,6 +6,7 @@ from pathlib import Path
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
+import tkinter.font as tkfont
 import colorsys
 
 import pandas as pd
@@ -102,6 +103,7 @@ class _RoundedCard(tk.Canvas):
         self._border_width = border_width
         self._padx, self._pady = pad
         self._shape_id: int | None = None
+        self._explicit_height = height
 
         if height is not None:
             self.configure(height=height)
@@ -114,6 +116,19 @@ class _RoundedCard(tk.Canvas):
         )
 
         self.bind("<Configure>", self._redraw)
+        self.inner.bind("<Configure>", self._on_inner_configure)
+
+    def _on_inner_configure(self, _event: tk.Event | None = None) -> None:
+        # Canvas does not reliably grow vertically with embedded content; taller inner
+        # (e.g. toxicity preview Text) clips widgets packed below unless we resize.
+        if self._explicit_height is not None:
+            return
+        self.update_idletasks()
+        inner_h = int(self.inner.winfo_reqheight())
+        needed = max(1, inner_h + (self._pady * 2))
+        cur = int(self.winfo_height())
+        if abs(cur - needed) > 1:
+            self.configure(height=needed)
 
     def _redraw(self, _event: tk.Event) -> None:
         w = max(1, int(self.winfo_width()))
@@ -659,11 +674,25 @@ class ToxicCommentApp:
         input_card.pack(fill="x", padx=18, pady=(0, 16))
         input_card_inner = input_card.inner
 
+        tox_input_wrap = tk.Frame(input_card_inner, bg=self._tox_card_bg)
+        tox_input_wrap.pack(fill="x")
+        tox_input_wrap.columnconfigure(0, weight=1)
+        tox_input_wrap.rowconfigure(0, weight=1)
+
+        # Text height is in lines, not pixels — grow the visible preview by ~150px using font metrics.
+        _tox_font_spec = ("Segoe UI", 10)
+        _line_px = max(
+            1,
+            int(tkfont.Font(master=body, font=_tox_font_spec).metrics("linespace")),
+        )
+        _extra_lines = max(1, int(round(150 / _line_px)))
+        _tox_input_height_lines = 6 + _extra_lines
+
         self.tox_input = tk.Text(
-            input_card_inner,
-            height=6,
+            tox_input_wrap,
+            height=_tox_input_height_lines,
             wrap="word",
-            font=("Segoe UI", 10),
+            font=_tox_font_spec,
             bd=0,
             highlightthickness=1,
             highlightbackground=self._tox_border,
@@ -671,7 +700,10 @@ class ToxicCommentApp:
             padx=10,
             pady=10,
         )
-        self.tox_input.pack(fill="x")
+        tox_input_v = ttk.Scrollbar(tox_input_wrap, orient="vertical", command=self.tox_input.yview)
+        self.tox_input.configure(yscrollcommand=tox_input_v.set)
+        self.tox_input.grid(row=0, column=0, sticky="nsew")
+        tox_input_v.grid(row=0, column=1, sticky="ns")
 
         actions = tk.Frame(input_card_inner, bg=self._tox_card_bg)
         actions.pack(fill="x", pady=(12, 0))
