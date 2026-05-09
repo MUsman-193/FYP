@@ -94,7 +94,7 @@ class ModelManager:
                 }
             )
 
-        table = pd.DataFrame(rows).sort_values(by="F1_Macro", ascending=False)
+        table = pd.DataFrame(rows).sort_values(by="F1_Macro", ascending=False) 
         best_row = table.iloc[0]
         return InvestigationResult(
             table=table.reset_index(drop=True),

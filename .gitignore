@@ -16,3 +16,6 @@ Thumbs.db
 
 # Data artifacts
 data/processed/
+
+# FYP model weights and optional tokenizer/config in modal/ (download separately; see README)
+modal/

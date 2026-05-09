@@ -12,7 +12,12 @@ import colorsys
 import pandas as pd
 
 from augmentation import AugmentConfig, TextAugmenter
-from moderation import ProfanitySanitizer, ProfanityScanner
+from moderation import (
+    LocalToxicityAnalyzer,
+    ProfanitySanitizer,
+    ProfanityScanner,
+    ToxicityModelError,
+)
 from preprocessing import PreprocessConfig, TextPreprocessor
 
 # Max rows rendered in Dataset Preview (full file still loaded; raise if UI tolerates it).
@@ -31,6 +36,16 @@ def _hsl_to_hex(h: float, s: float, l: float) -> str:
     l_norm = max(0.0, min(1.0, l / 100.0))
     r, g, b = colorsys.hls_to_rgb(h_norm, l_norm, s_norm)
     return f"#{int(round(r * 255)):02x}{int(round(g * 255)):02x}{int(round(b * 255)):02x}"
+
+
+def _overall_toxicity_theme(overall: int) -> tuple[str, str]:
+    """Return (accent foreground, soft card background) for overall score 0..100."""
+    o = max(0, min(100, int(overall)))
+    if o < 35:
+        return _hsl_to_hex(142, 71, 45), _hsl_to_hex(142, 71, 95)
+    if o < 70:
+        return _hsl_to_hex(38, 92, 42), _hsl_to_hex(38, 86, 94)
+    return _hsl_to_hex(0, 72, 46), _hsl_to_hex(0, 79, 96)
 
 
 def _draw_rounded_rect(
@@ -118,19 +133,13 @@ class _RoundedCard(tk.Canvas):
         self.bind("<Configure>", self._redraw)
         self.inner.bind("<Configure>", self._on_inner_configure)
 
-    def _on_inner_configure(self, _event: tk.Event | None = None) -> None:
-        # Canvas does not reliably grow vertically with embedded content; taller inner
-        # (e.g. toxicity preview Text) clips widgets packed below unless we resize.
-        if self._explicit_height is not None:
-            return
-        self.update_idletasks()
-        inner_h = int(self.inner.winfo_reqheight())
-        needed = max(1, inner_h + (self._pady * 2))
-        cur = int(self.winfo_height())
-        if abs(cur - needed) > 1:
-            self.configure(height=needed)
+    def set_card_background(self, bg: str) -> None:
+        """Update card fill and inner frame (e.g. toxicity score band)."""
+        self._card_bg = bg
+        self.inner.configure(bg=bg)
+        self._paint_card_shape()
 
-    def _redraw(self, _event: tk.Event) -> None:
+    def _paint_card_shape(self) -> None:
         w = max(1, int(self.winfo_width()))
         h = max(1, int(self.winfo_height()))
         self.delete("card_shape")
@@ -148,10 +157,22 @@ class _RoundedCard(tk.Canvas):
         self.addtag_withtag("card_shape", self._shape_id)
         self.tag_lower("card_shape")
         self.coords(self._inner_window, self._padx, self._pady)
-        self.itemconfigure(
-            self._inner_window,
-            width=max(1, w - (self._padx * 2)),
-        )
+        self.itemconfigure(self._inner_window, width=max(1, w - (self._padx * 2)))
+
+    def _on_inner_configure(self, _event: tk.Event | None = None) -> None:
+        # Canvas does not reliably grow vertically with embedded content; taller inner
+        # (e.g. toxicity preview Text) clips widgets packed below unless we resize.
+        if self._explicit_height is not None:
+            return
+        self.update_idletasks()
+        inner_h = int(self.inner.winfo_reqheight())
+        needed = max(1, inner_h + (self._pady * 2))
+        cur = int(self.winfo_height())
+        if abs(cur - needed) > 1:
+            self.configure(height=needed)
+
+    def _redraw(self, _event: tk.Event) -> None:
+        self._paint_card_shape()
 
 
 class _RoundedButton(tk.Canvas):
@@ -292,6 +313,8 @@ class ToxicCommentApp:
         self.augmenter = TextAugmenter(seed=42)
         self.profanity_scanner = ProfanityScanner()
         self.profanity_sanitizer = ProfanitySanitizer(self.profanity_scanner.terms)
+        # FYP model weights in project modal/ (see LocalToxicityAnalyzer). Falls back if load/inference fails.
+        self.toxicity_analyzer = LocalToxicityAnalyzer()
         self.model_manager = None
         self._modeling_available = False
         self._modeling_error: str | None = None
@@ -318,6 +341,11 @@ class ToxicCommentApp:
             "remove_stopwords": tk.BooleanVar(value=False),
             "remove_numbers": tk.BooleanVar(value=False),
             "normalize_whitespace": tk.BooleanVar(value=False),
+            "normalize_unicode": tk.BooleanVar(value=False),
+            "remove_noise": tk.BooleanVar(value=False),
+            "reduce_elongations": tk.BooleanVar(value=False),
+            "map_slang": tk.BooleanVar(value=False),
+            "expand_contractions": tk.BooleanVar(value=False),
         }
         self.aug_vars = {
             "synonym_replacement": tk.BooleanVar(value=False),
@@ -419,8 +447,13 @@ class ToxicCommentApp:
         def _divider(parent: tk.Misc) -> None:
             tk.Frame(parent, bg=self._tox_border, height=1).pack(fill="x", pady=(10, 10))
 
-        prep_frame = _sidebar_card(left, "Preprocessing", height=280)
+        prep_frame = _sidebar_card(left, "Preprocessing", height=430)
         prep_labels = [
+            ("Unicode Normalize (NFKC)", "normalize_unicode"),
+            ("Remove Noise (URLs, emails, HTML, @mentions)", "remove_noise"),
+            ("Reduce Repeated Letters (soooo → soo)", "reduce_elongations"),
+            ("Map Internet Slang (u→you, lol, …)", "map_slang"),
+            ("Expand Contractions (don't→do not, …)", "expand_contractions"),
             ("Lowercasing", "lowercase"),
             ("Remove Punctuation", "remove_punctuation"),
             ("Remove Stopwords", "remove_stopwords"),
@@ -759,14 +792,16 @@ class ToxicCommentApp:
         )
         overall.pack(fill="x", padx=18, pady=(0, 14))
         overall_inner = overall.inner
+        self._overall_score_card = overall
 
-        tk.Label(
+        self._overall_score_title_label = tk.Label(
             overall_inner,
             text="Overall Toxicity Score",
             font=("Segoe UI", 10),
             bg=self._tox_green_bg,
             fg=self._tox_muted,
-        ).pack(pady=(18, 2))
+        )
+        self._overall_score_title_label.pack(pady=(18, 2))
 
         self.overall_pct_label = tk.Label(
             overall_inner,
@@ -868,6 +903,12 @@ class ToxicCommentApp:
             padx=10,
             pady=8,
         )
+        lo_fg, _ = _overall_toxicity_theme(10)
+        med_fg, _ = _overall_toxicity_theme(50)
+        hi_fg, _ = _overall_toxicity_theme(85)
+        self.result_text.tag_configure("tox_summary_low", foreground=lo_fg)
+        self.result_text.tag_configure("tox_summary_med", foreground=med_fg)
+        self.result_text.tag_configure("tox_summary_high", foreground=hi_fg)
         logs_v = ttk.Scrollbar(logs_inner, orient="vertical", command=self.result_text.yview)
         self.result_text.configure(yscrollcommand=logs_v.set)
         self.result_text.grid(row=0, column=0, sticky="nsew")
@@ -906,8 +947,8 @@ class ToxicCommentApp:
         self._show_text_preview(content)
 
     def _analyze_toxicity_text(self) -> None:
-        text = self.tox_input.get("1.0", END).strip()
-        if not text:
+        text_raw = self.tox_input.get("1.0", END).strip()
+        if not text_raw:
             messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
             return
 
@@ -917,49 +958,114 @@ class ToxicCommentApp:
                 self._tox_results_wrap.pack(fill="x", pady=(0, 6))
                 self._tox_results_visible = True
 
-            # Heuristic scoring using existing profanity scanner signals (keeps UI responsive).
-            scan = self.profanity_scanner.scan_text(text)
-            prof = int(scan.profanity_count)
-            toxic = min(100, prof * 15)
-            severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
-            identity = 0
-            insult = min(100, prof * 6)
-            profanity = min(100, prof * 20)
-            threat = 0
+            # Same preprocessing pipeline as dataset Apply (quote fences, noise, etc.).
+            text = self.preprocessor.apply(text_raw, self._build_prep_config())
 
-            metrics = {
-                "Toxicity": toxic,
-                "Severe Toxicity": severe,
-                "Identity Attack": identity,
-                "Insult": insult,
-                "Profanity": profanity,
-                "Threat": threat,
-            }
-            overall = int(round(sum(metrics.values()) / len(metrics)))
+            # Primary: local modal/FYP-model.safetensors (FYP toxicity model).
+            try:
+                analysis = self.toxicity_analyzer.analyze(text)
+                metrics, overall = self._metrics_from_llm_analysis(
+                    toxicity_level=analysis.toxicity_level,
+                    toxicity_types=analysis.toxicity_type,
+                )
+                self._update_toxicity_ui(overall=overall, metrics=metrics)
 
-            self._update_toxicity_ui(overall=overall, metrics=metrics)
+                summary = (
+                    "Toxicity Analysis Result (local model)\n"
+                    f"- Category: {', '.join(analysis.category) if analysis.category else 'None'}\n"
+                    f"- Toxicity Level: {analysis.toxicity_level}\n"
+                    f"- Toxicity Type: {', '.join(analysis.toxicity_type) if analysis.toxicity_type else 'None'}\n"
+                )
+                if analysis.explanation:
+                    summary += f"- Explanation: {analysis.explanation}\n"
+                summary += (
+                    f"- UI Score (derived): {overall}%\n"
+                    f"  - Toxicity: {metrics['Toxicity']}%\n"
+                    f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
+                    f"  - Identity Attack: {metrics['Identity Attack']}%\n"
+                    f"  - Insult: {metrics['Insult']}%\n"
+                    f"  - Profanity: {metrics['Profanity']}%\n"
+                    f"  - Threat: {metrics['Threat']}%"
+                )
+                self._log_toxicity_summary(summary, overall)
+            except ToxicityModelError as exc:
+                # Fallback: heuristic scoring using profanity scanner (keeps UI usable offline).
+                scan = self.profanity_scanner.scan_text(text)
+                prof = int(scan.profanity_count)
+                toxic = min(100, prof * 15)
+                severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
+                identity = 0
+                insult = min(100, prof * 6)
+                profanity = min(100, prof * 20)
+                threat = 0
 
-            summary = (
-                "Toxicity Analysis Result\n"
-                f"- Overall: {overall}%\n"
-                f"- Toxicity: {toxic}%\n"
-                f"- Severe Toxicity: {severe}%\n"
-                f"- Identity Attack: {identity}%\n"
-                f"- Insult: {insult}%\n"
-                f"- Profanity: {profanity}%\n"
-                f"- Threat: {threat}%"
-            )
-            self._log(summary)
+                metrics = {
+                    "Toxicity": toxic,
+                    "Severe Toxicity": severe,
+                    "Identity Attack": identity,
+                    "Insult": insult,
+                    "Profanity": profanity,
+                    "Threat": threat,
+                }
+                overall = int(round(sum(metrics.values()) / len(metrics)))
+                self._update_toxicity_ui(overall=overall, metrics=metrics)
+                hf_summary = (
+                    "Toxicity Analysis Result (heuristic fallback)\n"
+                    f"- UI Score (derived): {overall}%\n"
+                    f"  - Toxicity: {metrics['Toxicity']}%\n"
+                    f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
+                    f"  - Identity Attack: {metrics['Identity Attack']}%\n"
+                    f"  - Insult: {metrics['Insult']}%\n"
+                    f"  - Profanity: {metrics['Profanity']}%\n"
+                    f"  - Threat: {metrics['Threat']}%"
+                )
+                self._log_toxicity_summary(hf_summary, overall)
+                self._log(f"Local toxicity model unavailable; used heuristic fallback. Reason: {exc}")
         except Exception as exc:
             messagebox.showerror("Analyze Error", str(exc))
             self._log(f"Analyze Error: {exc}")
             return
 
+    def _metrics_from_llm_analysis(
+        self,
+        *,
+        toxicity_level: str,
+        toxicity_types: list[str],
+    ) -> tuple[dict[str, int], int]:
+        # Convert model labels to the existing UI's 6 metrics.
+        lvl = (toxicity_level or "").strip().lower()
+        base = {"low": 20, "medium": 55, "high": 80, "severe": 95}.get(lvl, 40)
+        severe = {"low": 0, "medium": 35, "high": 70, "severe": 95}.get(lvl, 30)
+
+        types = {t.strip().lower(): t for t in (toxicity_types or []) if t and t.strip()}
+        identity = 85 if "identity attack" in types else 0
+        threat = 85 if "threat" in types else 0
+        profanity = 80 if "profanity" in types else 0
+        insult = 70 if ("insult" in types or "bullying" in types or "political abuse" in types) else 0
+
+        # If the model says it's toxic but didn't name any type, keep something non-zero.
+        if base >= 55 and max(identity, threat, profanity, insult) == 0:
+            insult = 55
+
+        metrics = {
+            "Toxicity": int(max(0, min(100, base))),
+            "Severe Toxicity": int(max(0, min(100, severe))),
+            "Identity Attack": int(max(0, min(100, identity))),
+            "Insult": int(max(0, min(100, insult))),
+            "Profanity": int(max(0, min(100, profanity))),
+            "Threat": int(max(0, min(100, threat))),
+        }
+        overall = int(round(sum(metrics.values()) / len(metrics)))
+        return metrics, overall
+
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
         overall = max(0, min(100, int(overall)))
-        self.overall_pct_label.configure(text=f"{overall}%")
+        accent, card_bg = _overall_toxicity_theme(overall)
+        self.overall_pct_label.configure(text=f"{overall}%", fg=accent, bg=card_bg)
         label = "Low Toxicity" if overall < 35 else ("Medium Toxicity" if overall < 70 else "High Toxicity")
-        self.overall_badge.configure(text=label)
+        self.overall_badge.configure(text=label, fg=accent, bg=card_bg)
+        self._overall_score_title_label.configure(bg=card_bg, fg=self._tox_muted)
+        self._overall_score_card.set_card_background(card_bg)
 
         # Update metric cards + bars
         for title, value in metrics.items():
@@ -1139,6 +1245,11 @@ class ToxicCommentApp:
             messagebox.showerror("Suggestion Error", str(exc))
             return
 
+        self.prep_vars["normalize_unicode"].set(cfg.normalize_unicode)
+        self.prep_vars["remove_noise"].set(cfg.remove_noise)
+        self.prep_vars["reduce_elongations"].set(cfg.reduce_elongations)
+        self.prep_vars["map_slang"].set(cfg.map_slang)
+        self.prep_vars["expand_contractions"].set(cfg.expand_contractions)
         self.prep_vars["lowercase"].set(cfg.lowercase)
         self.prep_vars["remove_punctuation"].set(cfg.remove_punctuation)
         self.prep_vars["remove_stopwords"].set(cfg.remove_stopwords)
@@ -1152,6 +1263,11 @@ class ToxicCommentApp:
 
     def _build_prep_config(self) -> PreprocessConfig:
         return PreprocessConfig(
+            normalize_unicode=self.prep_vars["normalize_unicode"].get(),
+            remove_noise=self.prep_vars["remove_noise"].get(),
+            reduce_elongations=self.prep_vars["reduce_elongations"].get(),
+            map_slang=self.prep_vars["map_slang"].get(),
+            expand_contractions=self.prep_vars["expand_contractions"].get(),
             lowercase=self.prep_vars["lowercase"].get(),
             remove_punctuation=self.prep_vars["remove_punctuation"].get(),
             remove_stopwords=self.prep_vars["remove_stopwords"].get(),
@@ -1356,6 +1472,18 @@ class ToxicCommentApp:
 
     def _log(self, text: str) -> None:
         self.result_text.insert(END, f"{text}\n")
+        self.result_text.see(END)
+
+    def _log_toxicity_summary(self, text: str, overall: int) -> None:
+        """Append analysis summary to Logs / Results with color from overall score."""
+        overall = max(0, min(100, int(overall)))
+        if overall < 35:
+            tag = "tox_summary_low"
+        elif overall < 70:
+            tag = "tox_summary_med"
+        else:
+            tag = "tox_summary_high"
+        self.result_text.insert(END, f"{text}\n", (tag,))
         self.result_text.see(END)
 
     def _on_left_frame_configure(self, _event: tk.Event) -> None:
