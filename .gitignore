@@ -17,5 +17,5 @@ Thumbs.db
 # Data artifacts
 data/processed/
 
-# FYP model weights and optional tokenizer/config in modal/ (download separately; see README)
-modal/
+# Large FYP weight files only — the modal/ folder is tracked so clones have a place to put weights.
+modal/*.safetensors
