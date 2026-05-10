@@ -413,23 +413,6 @@ class ToxicCommentApp:
             )
         ttk.Button(nav_btns, text="Log out", command=self._logout).pack(side="left")
 
-        top = ttk.LabelFrame(container, text="Dataset", padding=10)
-        top.pack(fill="x")
-
-        ttk.Label(top, text="Text Column").grid(row=0, column=0, sticky="w")
-        self.text_col_combo = ttk.Combobox(
-            top, textvariable=self.text_col_var, state="readonly", width=35
-        )
-        self.text_col_combo.grid(row=0, column=1, sticky="w")
-
-        ttk.Label(top, text="Label Column").grid(
-            row=0, column=2, sticky="e", padx=(15, 6)
-        )
-        self.label_col_combo = ttk.Combobox(
-            top, textvariable=self.label_col_var, state="readonly", width=30
-        )
-        self.label_col_combo.grid(row=0, column=3, sticky="w")
-
         middle = ttk.Frame(container)
         middle.pack(fill="both", expand=True, pady=10)
 

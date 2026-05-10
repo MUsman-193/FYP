@@ -15,7 +15,7 @@ def run() -> None:
     if "vista" in style.theme_names():
         style.theme_use("vista")
     root.title("Toxic Comment Classification Workbench")
-    root.geometry("520x420")
+    root.geometry("800x700")
 
     def open_app(user: UserRecord) -> None:
         root.geometry("1280x800")
@@ -24,7 +24,7 @@ def run() -> None:
         ToxicCommentApp(root, user=user, on_logout=lambda: show_login(root))
 
     def show_login(r: tk.Tk) -> None:
-        r.geometry("520x420")
+        r.geometry("800x700")
         for w in r.winfo_children():
             w.destroy()
         AuthFrame(r, on_success=open_app)
