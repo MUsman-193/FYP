@@ -996,7 +996,17 @@ class ToxicCommentApp:
                 self._log_toxicity_summary(hf_summary, overall)
                 self._log("Local toxicity model unavailable; used heuristic fallback for this analysis.")
 
-            self._record_single_run(text_raw=text_raw, overall=overall, summary_line=f"Single: score={overall}% level={lvl}")
+            self._record_single_run(
+                text_raw=text_raw,
+                overall=overall,
+                metrics=metrics,
+                summary_line=(
+                    "Single: "
+                    f"top={max(metrics.items(), key=lambda kv: int(kv[1]))[0]} "
+                    f"({max((int(v) for v in metrics.values()), default=0)}%) "
+                    f"level={lvl}"
+                ),
+            )
         except Exception as exc:
             messagebox.showerror("Analyze Error", str(exc))
             self._log(f"Analyze Error: {exc}")
@@ -1152,8 +1162,12 @@ class ToxicCommentApp:
 
         self.df = df.copy()
         cols = list(self.df.columns.astype(str))
-        self.text_col_combo["values"] = cols
-        self.label_col_combo["values"] = cols
+        # Header column pickers were removed from the UI, so these comboboxes may not exist.
+        # Keep dataset loading functional by only updating them when present.
+        if hasattr(self, "text_col_combo"):
+            self.text_col_combo["values"] = cols  # type: ignore[attr-defined]
+        if hasattr(self, "label_col_combo"):
+            self.label_col_combo["values"] = cols  # type: ignore[attr-defined]
 
         text_col = self._detect_text_column(self.df)
         label_col = self._detect_label_column(self.df, text_col)
@@ -1487,8 +1501,15 @@ class ToxicCommentApp:
     def _logout(self) -> None:
         self._on_logout()
 
-    def _record_single_run(self, *, text_raw: str, overall: int, summary_line: str) -> None:
-        toxic = 1 if overall >= 35 else 0
+    def _record_single_run(
+        self,
+        *,
+        text_raw: str,
+        overall: int,
+        metrics: dict[str, int],
+        summary_line: str,
+    ) -> None:
+        toxic = 1 if (max((int(v) for v in metrics.values()), default=0) >= 20) else 0
         snippet = text_raw.strip().replace("\n", " ")[:500]
         summary = f"{summary_line}\nText preview: {snippet}"
         self._store.insert_run(
