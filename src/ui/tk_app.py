@@ -6,10 +6,13 @@ from pathlib import Path
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
-import tkinter.font as tkfont
-import colorsys
+from typing import Callable
 
 import pandas as pd
+
+from auth import UserRecord, get_store
+import tkinter.font as tkfont
+import colorsys
 
 from augmentation import AugmentConfig, TextAugmenter
 from moderation import (
@@ -301,10 +304,14 @@ class _RoundedButton(tk.Canvas):
 
 
 class ToxicCommentApp:
-    def __init__(self, root: Tk) -> None:
+    def __init__(self, root: Tk, *, user: UserRecord, on_logout: Callable[[], None]) -> None:
         self.root = root
         self.root.title("Toxic Comment Classification Workbench")
         self.root.geometry("1280x800")
+
+        self._user = user
+        self._on_logout = on_logout
+        self._store = get_store()
 
         self.df: pd.DataFrame | None = None
         self._dataset_path: Path | None = None
@@ -381,6 +388,30 @@ class ToxicCommentApp:
 
         container = ttk.Frame(self.root, padding=10)
         container.pack(fill="both", expand=True)
+
+        nav = tk.Frame(container, bg=self._tox_bg)
+        nav.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            nav,
+            text=f"Signed in as {self._user.username}"
+            + (" (administrator)" if self._user.is_admin else ""),
+            font=("Segoe UI", 10),
+            bg=self._tox_bg,
+            fg=self._tox_muted,
+        ).pack(side="left")
+        nav_btns = tk.Frame(nav, bg=self._tox_bg)
+        nav_btns.pack(side="right")
+        ttk.Button(nav_btns, text="Analysis history", command=self._open_history_dialog).pack(
+            side="left", padx=(0, 6)
+        )
+        if self._user.is_admin:
+            ttk.Button(nav_btns, text="Manage users", command=self._open_admin_users_dialog).pack(
+                side="left", padx=(0, 6)
+            )
+            ttk.Button(nav_btns, text="System statistics", command=self._open_admin_stats_dialog).pack(
+                side="left", padx=(0, 6)
+            )
+        ttk.Button(nav_btns, text="Log out", command=self._logout).pack(side="left")
 
         top = ttk.LabelFrame(container, text="Dataset", padding=10)
         top.pack(fill="x")
@@ -613,27 +644,14 @@ class ToxicCommentApp:
         )
         self.train_button.configure(height=34)
         self.train_button.pack(fill="x")
-        save_btn = _RoundedButton(
-            model_frame,
-            text="Save Processed Dataset",
-            bg="#ffffff",
-            fg=self._tox_text,
-            command=self._save_dataset,
-            border=self._tox_border,
-            radius=12,
-            hover_bg="#f3f4f6",
-            active_bg="#e5e7eb",
-        )
-        save_btn.configure(height=34)
-        save_btn.pack(fill="x", pady=(8, 0))
         if not self._modeling_available:
             self.model_combo.configure(state="disabled")
-            self.train_button.configure(state="disabled")
+            self.train_button.set_enabled(False)
 
             # Disable the investigate button too.
             for child in model_frame.winfo_children():
                 if isinstance(child, _RoundedButton) and getattr(child, "_text", "") == "Investigate Architectures":
-                    child.configure(state="disabled")
+                    child.set_enabled(False)
                     break
 
         # Right side: unified interface (Preview + Logs + Toxicity Analysis)
@@ -653,9 +671,24 @@ class ToxicCommentApp:
         self._tox_bg = "#f9fafb"
         self._tox_card_bg = "#ffffff"
 
-        canvas = tk.Canvas(parent, bg=self._tox_bg, highlightthickness=0)
+        header_bar = tk.Frame(parent, bg=self._tox_bg)
+        header_bar.pack(fill="x", side="top")
+        header_inner = tk.Frame(header_bar, bg=self._tox_bg)
+        header_inner.pack(fill="x", padx=18, pady=(10, 6))
+        tk.Label(
+            header_inner,
+            text="Toxicity analysis",
+            font=("Segoe UI", 14, "bold"),
+            bg=self._tox_bg,
+            fg=self._tox_text,
+        ).pack(side="left")
+
+        scroll_host = tk.Frame(parent, bg=self._tox_bg)
+        scroll_host.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(scroll_host, bg=self._tox_bg, highlightthickness=0)
         canvas.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
         scrollbar.pack(side="right", fill="y")
         canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -677,30 +710,13 @@ class ToxicCommentApp:
         body.bind("<Configure>", on_body_configure)
         canvas.bind("<Configure>", on_canvas_configure)
 
-        # Title
         tk.Label(
             body,
-            text="Toxicity Analysis",
-            font=("Segoe UI", 20, "bold"),
-            bg=self._tox_bg,
-            fg=self._tox_text,
-        ).pack(pady=(18, 4))
-        tk.Label(
-            body,
-            text="Enter a comment or upload a file to analyze for toxic content",
+            text="Enter a comment or upload a file to analyze for toxic content.",
             font=("Segoe UI", 10),
             bg=self._tox_bg,
             fg=self._tox_muted,
-        ).pack(pady=(0, 14))
-
-        # Toxicity analysis section (analysis shown above Logs/Results)
-        tk.Label(
-            body,
-            text="Toxicity Analysis",
-            font=("Segoe UI", 14, "bold"),
-            bg=self._tox_bg,
-            fg=self._tox_text,
-        ).pack(anchor="w", padx=18, pady=(4, 10))
+        ).pack(pady=(12, 14))
 
         # Input card
         input_card = _RoundedCard(body, bg=self._tox_card_bg, border=self._tox_border, radius=12, pad=(14, 14))
@@ -961,23 +977,18 @@ class ToxicCommentApp:
             # Same preprocessing pipeline as dataset Apply (quote fences, noise, etc.).
             text = self.preprocessor.apply(text_raw, self._build_prep_config())
 
-            # Primary: local modal/FYP-model.safetensors (FYP toxicity model).
-            try:
-                analysis = self.toxicity_analyzer.analyze(text)
-                metrics, overall = self._metrics_from_llm_analysis(
-                    toxicity_level=analysis.toxicity_level,
-                    toxicity_types=analysis.toxicity_type,
-                )
-                self._update_toxicity_ui(overall=overall, metrics=metrics)
+            metrics, overall, lvl, cats, types_j, used_model, expl = self._analyze_text_for_metrics(text)
+            self._update_toxicity_ui(overall=overall, metrics=metrics)
 
+            if used_model:
                 summary = (
                     "Toxicity Analysis Result (local model)\n"
-                    f"- Category: {', '.join(analysis.category) if analysis.category else 'None'}\n"
-                    f"- Toxicity Level: {analysis.toxicity_level}\n"
-                    f"- Toxicity Type: {', '.join(analysis.toxicity_type) if analysis.toxicity_type else 'None'}\n"
+                    f"- Category: {cats or 'None'}\n"
+                    f"- Toxicity Level: {lvl}\n"
+                    f"- Toxicity Type: {types_j or 'None'}\n"
                 )
-                if analysis.explanation:
-                    summary += f"- Explanation: {analysis.explanation}\n"
+                if expl:
+                    summary += f"- Explanation: {expl}\n"
                 summary += (
                     f"- UI Score (derived): {overall}%\n"
                     f"  - Toxicity: {metrics['Toxicity']}%\n"
@@ -988,27 +999,7 @@ class ToxicCommentApp:
                     f"  - Threat: {metrics['Threat']}%"
                 )
                 self._log_toxicity_summary(summary, overall)
-            except ToxicityModelError as exc:
-                # Fallback: heuristic scoring using profanity scanner (keeps UI usable offline).
-                scan = self.profanity_scanner.scan_text(text)
-                prof = int(scan.profanity_count)
-                toxic = min(100, prof * 15)
-                severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
-                identity = 0
-                insult = min(100, prof * 6)
-                profanity = min(100, prof * 20)
-                threat = 0
-
-                metrics = {
-                    "Toxicity": toxic,
-                    "Severe Toxicity": severe,
-                    "Identity Attack": identity,
-                    "Insult": insult,
-                    "Profanity": profanity,
-                    "Threat": threat,
-                }
-                overall = int(round(sum(metrics.values()) / len(metrics)))
-                self._update_toxicity_ui(overall=overall, metrics=metrics)
+            else:
                 hf_summary = (
                     "Toxicity Analysis Result (heuristic fallback)\n"
                     f"- UI Score (derived): {overall}%\n"
@@ -1020,7 +1011,9 @@ class ToxicCommentApp:
                     f"  - Threat: {metrics['Threat']}%"
                 )
                 self._log_toxicity_summary(hf_summary, overall)
-                self._log(f"Local toxicity model unavailable; used heuristic fallback. Reason: {exc}")
+                self._log("Local toxicity model unavailable; used heuristic fallback for this analysis.")
+
+            self._record_single_run(text_raw=text_raw, overall=overall, summary_line=f"Single: score={overall}% level={lvl}")
         except Exception as exc:
             messagebox.showerror("Analyze Error", str(exc))
             self._log(f"Analyze Error: {exc}")
@@ -1057,6 +1050,61 @@ class ToxicCommentApp:
         }
         overall = int(round(sum(metrics.values()) / len(metrics)))
         return metrics, overall
+
+    def _overall_bucket_level(self, overall: int) -> str:
+        o = max(0, min(100, int(overall)))
+        if o < 35:
+            return "Low"
+        if o < 70:
+            return "Medium"
+        if o < 90:
+            return "High"
+        return "Severe"
+
+    def _analyze_text_for_metrics(
+        self, text: str
+    ) -> tuple[dict[str, int], int, str, str, str, bool, str]:
+        """
+        Returns (metrics, overall, toxicity_level, categories_csv, types_csv, used_local_model, explanation).
+        """
+        try:
+            analysis = self.toxicity_analyzer.analyze(text)
+            metrics, overall = self._metrics_from_llm_analysis(
+                toxicity_level=analysis.toxicity_level,
+                toxicity_types=analysis.toxicity_type,
+            )
+            cats = ", ".join(analysis.category) if analysis.category else ""
+            types_j = ", ".join(analysis.toxicity_type) if analysis.toxicity_type else ""
+            expl = (analysis.explanation or "").strip()
+            return (
+                metrics,
+                overall,
+                analysis.toxicity_level,
+                cats,
+                types_j,
+                True,
+                expl,
+            )
+        except ToxicityModelError:
+            scan = self.profanity_scanner.scan_text(text)
+            prof = int(scan.profanity_count)
+            toxic = min(100, prof * 15)
+            severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
+            identity = 0
+            insult = min(100, prof * 6)
+            profanity = min(100, prof * 20)
+            threat = 0
+            metrics = {
+                "Toxicity": toxic,
+                "Severe Toxicity": severe,
+                "Identity Attack": identity,
+                "Insult": insult,
+                "Profanity": profanity,
+                "Threat": threat,
+            }
+            overall = int(round(sum(metrics.values()) / len(metrics)))
+            lvl = self._overall_bucket_level(overall)
+            return metrics, overall, lvl, "", "", False, ""
 
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
         overall = max(0, min(100, int(overall)))
@@ -1453,22 +1501,226 @@ class ToxicCommentApp:
         self._log("Classification report:")
         self._log(report)
 
-    def _save_dataset(self) -> None:
-        if self.df is None:
-            messagebox.showerror("Save Error", "Dataset not loaded.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    def _logout(self) -> None:
+        self._on_logout()
+
+    def _record_single_run(self, *, text_raw: str, overall: int, summary_line: str) -> None:
+        toxic = 1 if overall >= 35 else 0
+        snippet = text_raw.strip().replace("\n", " ")[:500]
+        summary = f"{summary_line}\nText preview: {snippet}"
+        self._store.insert_run(
+            user_id=self._user.id,
+            run_type="single",
+            source_filename=self._dataset_path.name if self._dataset_path else None,
+            row_count=1,
+            toxic_count=toxic,
+            non_toxic_count=1 - toxic,
+            summary=summary,
         )
-        if not path:
+
+    def _open_history_dialog(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Analysis history")
+        win.geometry("900x420")
+        win.transient(self.root)
+
+        cols = ("created", "type", "rows", "toxic", "nontoxic", "summary")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=14)
+        tree.heading("created", text="When (UTC)")
+        tree.heading("type", text="Type")
+        tree.heading("rows", text="Rows")
+        tree.heading("toxic", text="Toxic")
+        tree.heading("nontoxic", text="Non-toxic")
+        tree.heading("summary", text="Summary")
+        tree.column("created", width=160)
+        tree.column("type", width=70)
+        tree.column("rows", width=60)
+        tree.column("toxic", width=60)
+        tree.column("nontoxic", width=70)
+        tree.column("summary", width=420)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def refresh() -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for r in self._store.list_runs_for_user(self._user.id):
+                tree.insert(
+                    "",
+                    "end",
+                    iid=str(r["id"]),
+                    values=(
+                        r.get("created_at") or "",
+                        r.get("run_type") or "",
+                        r.get("row_count"),
+                        r.get("toxic_count"),
+                        r.get("non_toxic_count"),
+                        (r.get("summary") or "").replace("\n", " ")[:200],
+                    ),
+                )
+
+        refresh()
+
+        def on_details(_event: tk.Event | None = None) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            rid = int(sel[0])
+            row = self._store.get_run(rid, self._user.id)
+            if not row:
+                return
+            rp = row.get("results_path")
+            detail = (row.get("summary") or "").strip()
+            if rp and Path(rp).is_file():
+                detail += f"\n\nSaved results file:\n{rp}"
+            messagebox.showinfo("Run details", detail or "(No summary)")
+
+        tree.bind("<Double-1>", on_details)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def _open_admin_users_dialog(self) -> None:
+        if not self._user.is_admin:
             return
+        win = tk.Toplevel(self.root)
+        win.title("Manage users")
+        win.geometry("720x380")
+        win.transient(self.root)
+
+        cols = ("id", "username", "admin", "blocked", "created")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=12)
+        for c, t, w in (
+            ("id", "ID", 50),
+            ("username", "Username", 180),
+            ("admin", "Admin", 60),
+            ("blocked", "Blocked", 70),
+            ("created", "Created (UTC)", 200),
+        ):
+            tree.heading(c, text=t)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def refresh() -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for u in self._store.list_users():
+                tree.insert(
+                    "",
+                    "end",
+                    iid=str(u["id"]),
+                    values=(
+                        u["id"],
+                        u["username"],
+                        "yes" if u["is_admin"] else "no",
+                        "yes" if u["is_blocked"] else "no",
+                        u.get("created_at") or "",
+                    ),
+                )
+
+        refresh()
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+
+        def selected_id() -> int | None:
+            sel = tree.selection()
+            return int(sel[0]) if sel else None
+
+        def do_block() -> None:
+            uid = selected_id()
+            if uid is None:
+                return
+            self._store.set_blocked(uid, True)
+            refresh()
+
+        def do_unblock() -> None:
+            uid = selected_id()
+            if uid is None:
+                return
+            self._store.set_blocked(uid, False)
+            refresh()
+
+        def do_delete() -> None:
+            uid = selected_id()
+            if uid is None:
+                return
+            if uid == self._user.id:
+                messagebox.showerror("Manage users", "You cannot delete your own account while signed in.")
+                return
+            if not messagebox.askyesno("Manage users", "Delete this user and all of their analysis history?"):
+                return
+            self._store.delete_user(uid)
+            refresh()
+
+        ttk.Button(btn_row, text="Block selected", command=do_block).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Unblock selected", command=do_unblock).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Delete selected", command=do_delete).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side="right", padx=4)
+
+    def _open_admin_stats_dialog(self) -> None:
+        if not self._user.is_admin:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("System statistics")
+        win.geometry("900x560")
+        win.transient(self.root)
+
+        stats = self._store.admin_aggregate_stats()
+        total = int(stats["comments_analyzed"])
+        toxic = int(stats["toxic_comments"])
+        nontoxic = int(stats["non_toxic_comments"])
+
+        summary = ttk.LabelFrame(win, text="Totals (all users)", padding=10)
+        summary.pack(fill="x", padx=10, pady=10)
+        ttk.Label(
+            summary,
+            text=f"Comments analyzed (recorded runs): {total:,}\n"
+            f"Toxic (score ≥ 35): {toxic:,}\n"
+            f"Non-toxic: {nontoxic:,}",
+        ).pack(anchor="w")
+
         try:
-            self.df.to_csv(path, index=False)
-        except Exception as exc:
-            messagebox.showerror("Save Error", str(exc))
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+        except ImportError:
+            ttk.Label(
+                win,
+                text="Install matplotlib to see charts (pip install matplotlib).",
+            ).pack(pady=10)
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
             return
-        self._log(f"Saved dataset to: {path}")
+
+        fig = Figure(figsize=(9, 4.2), dpi=100)
+        ax1 = fig.add_subplot(121)
+        timeline = stats.get("timeline_days") or []
+        if timeline:
+            days, counts = zip(*timeline)
+            ax1.bar(days, counts, color="#2563eb")
+            ax1.set_title("Comments analyzed per day")
+            ax1.tick_params(axis="x", rotation=45)
+            ax1.set_ylabel("Rows")
+        else:
+            ax1.text(0.5, 0.5, "No history yet", ha="center", va="center")
+            ax1.axis("off")
+
+        ax2 = fig.add_subplot(122)
+        if toxic + nontoxic > 0:
+            ax2.pie(
+                [toxic, nontoxic],
+                labels=["Toxic (≥35)", "Non-toxic"],
+                autopct="%1.1f%%",
+                colors=["#dc2626", "#16a34a"],
+                startangle=90,
+            )
+            ax2.set_title("Toxic vs non-toxic (recorded)")
+        else:
+            ax2.text(0.5, 0.5, "No classified rows yet", ha="center", va="center")
+            ax2.axis("off")
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
 
     def _log(self, text: str) -> None:
         self.result_text.insert(END, f"{text}\n")
@@ -1509,12 +1761,3 @@ class ToxicCommentApp:
     def _preview_text_focus_in(self, _event: tk.Event) -> None:
         # Preview panel removed
         return
-
-
-def run() -> None:
-    root = Tk()
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    ToxicCommentApp(root)
-    root.mainloop()

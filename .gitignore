@@ -16,6 +16,8 @@ Thumbs.db
 
 # Data artifacts
 data/processed/
+data/workbench.sqlite3
+data/exports/
 
 # Large FYP weight files only — the modal/ folder is tracked so clones have a place to put weights.
 modal/*.safetensors
