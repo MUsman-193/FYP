@@ -1,7 +1,7 @@
-"""Toxicity analysis using the FYP model weights in ``modal/FYP-model.safetensors``.
+"""Toxicity analysis using weights under the project ``model/`` directory.
 
 Transformer weights are always loaded from that local file. Tokenizer and model
-``config.json`` are taken from ``modal/`` when you place them next to the weights,
+``config.json`` and tokenizer assets are loaded from ``model/`` next to the weights,
 from the ``FYP_METADATA_SOURCE`` environment variable if set, or otherwise from a
 built-in fallback so the app runs out of the box when a network cache is available.
 """
@@ -57,7 +57,26 @@ class ToxicityModelError(RuntimeError):
 
 
 def _default_weights_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "modal" / "FYP-model.safetensors"
+    env = os.environ.get("FYP_WEIGHTS_PATH", "").strip()
+    if env:
+        return Path(env)
+
+    model_dir = Path(__file__).resolve().parents[2] / "model"
+    preferred = [
+        model_dir / "FYP-model.safetensors",
+        model_dir / "model.safetensors",  # HF repos often name it like this
+    ]
+    for p in preferred:
+        if p.is_file():
+            return p
+
+    # Fallback: first .safetensors in model/ (if any).
+    for p in sorted(model_dir.glob("*.safetensors")):
+        if p.is_file():
+            return p
+
+    # Default expected name.
+    return preferred[0]
 
 
 def _modal_has_inference_files(modal_dir: Path) -> bool:
@@ -86,7 +105,7 @@ def _fallback_metadata_id() -> str:
 
 
 class LocalToxicityAnalyzer:
-    """Runs structured toxicity classification using ``modal/FYP-model.safetensors``."""
+    """Runs structured toxicity classification using local ``model/*.safetensors`` weights."""
 
     def __init__(
         self,
@@ -102,13 +121,17 @@ class LocalToxicityAnalyzer:
         self._model = None
         self._device = None
 
+    def preload(self) -> None:
+        """Load weights + tokenizer onto device (CPU or CUDA). Safe to call from a worker thread."""
+        self._ensure_loaded()
+
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
         if not self.weights_path.is_file():
             raise ToxicityModelError(
                 f"Local model weights not found: {self.weights_path}. "
-                "Place FYP-model.safetensors in the project modal/ folder."
+                "Place FYP-model.safetensors or model.safetensors in the project model/ folder."
             )
         try:
             import torch
@@ -127,7 +150,7 @@ class LocalToxicityAnalyzer:
         except Exception as exc:
             raise ToxicityModelError(
                 "Could not load FYP tokenizer/model settings. "
-                "Add config.json and tokenizer files next to FYP-model.safetensors in modal/, "
+                "Add config.json and tokenizer files next to the weights file in model/, "
                 "set FYP_METADATA_SOURCE to a folder that contains them, "
                 "or ensure a first-time network/cache is available. "
                 f"Details: {exc}"
@@ -158,33 +181,19 @@ class LocalToxicityAnalyzer:
             text = "" if text is None else str(text)
         text = text.strip()
         if not text:
-            return ToxicityAnalysis(
-                category=["None"],
-                toxicity_level="Low",
-                toxicity_type=[],
-                explanation="Empty input.",
-                raw_model_output="",
-            )
+            raise ToxicityModelError("Empty input; nothing to classify.")
 
         self._ensure_loaded()
         assert self._tokenizer is not None and self._model is not None and self._device is not None
 
         import torch
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a content moderation classifier. "
-                    "Return ONLY valid JSON. No markdown."
-                ),
-            },
-            {"role": "user", "content": _build_prompt(text)},
-        ]
-        prompt = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        # Some tokenizers (including many locally packaged ones) don't ship a chat_template.
+        # Use a plain-text prompt so local inference works without chat templates.
+        prompt = (
+            "You are a content moderation classifier. Return ONLY valid JSON. No markdown.\n\n"
+            + _build_prompt(text)
+            + "\n\nJSON:"
         )
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
 
@@ -194,7 +203,11 @@ class LocalToxicityAnalyzer:
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
                     do_sample=False,
-                    pad_token_id=self._tokenizer.eos_token_id,
+                    pad_token_id=(
+                        self._tokenizer.pad_token_id
+                        if self._tokenizer.pad_token_id is not None
+                        else self._tokenizer.eos_token_id
+                    ),
                 )
         except Exception as exc:
             raise ToxicityModelError(f"Model generation failed: {exc}") from exc
@@ -206,6 +219,10 @@ class LocalToxicityAnalyzer:
 
         parsed = _parse_json_object(content)
         category = _normalize_list(parsed.get("category"), allowed=_DEFAULT_CATEGORIES, fallback=["None"])
+        # Some generations echo almost every schema category; infer from toxicity_type instead.
+        if len(category) >= 9:
+            candidate = _infer_category_from_raw_types(parsed.get("toxicity_type"))
+            category = _normalize_list([candidate], allowed=_DEFAULT_CATEGORIES, fallback=["None"])
         toxicity_level = _normalize_level(parsed.get("toxicity_level"), allowed=_DEFAULT_LEVELS, fallback="Low")
         tox_types = _normalize_list(parsed.get("toxicity_type"), allowed=_DEFAULT_TYPES, fallback=[])
         explanation = str(parsed.get("explanation") or "").strip()
@@ -219,49 +236,143 @@ class LocalToxicityAnalyzer:
         )
 
 
+def _infer_category_from_raw_types(types_val: Any) -> str:
+    """Pick one category when model listed the whole enum verbatim."""
+    items: list[str] = []
+    if isinstance(types_val, list):
+        items = [str(x).strip() for x in types_val if str(x).strip()]
+    elif isinstance(types_val, str) and types_val.strip():
+        items = [types_val.strip()]
+
+    tl = [t.strip().lower() for t in items]
+    tl_set = set(tl)
+
+    def has(*needles: str) -> bool:
+        return bool(tl_set & set(needles))
+
+    if has("threat"):
+        return "Threats"
+    if has("identity attack"):
+        return "Harassment"
+    if has("bullying"):
+        return "Harassment"
+    if has("graphic violence"):
+        return "Violence"
+    if has("extremist language", "political abuse"):
+        return "Political Extremism"
+    if has("religious intolerance"):
+        return "Religious Hate"
+    if has("profanity"):
+        return "Profanity"
+    if has("insult"):
+        return "Harassment"
+    return "None"
+
+
 def _build_prompt(text: str) -> str:
+    cats = ", ".join(f'"{c}"' for c in _DEFAULT_CATEGORIES[:-1])
+    cats += ', or "None"'
+    types_ex = ", ".join(f'"{t}"' for t in _DEFAULT_TYPES)
+    levels = ", ".join(f'"{L}"' for L in _DEFAULT_LEVELS)
     return (
         "Analyze the following text for harmful or toxic content.\n\n"
         "Tasks:\n"
-        "1. Detect and identify toxic or offensive language.\n"
-        "2. Assign one or more categories for the content.\n"
-        "3. Rate the toxicity level.\n"
-        "4. Identify the toxicity type.\n"
-        "5. Provide the result in a structured format.\n\n"
-        "Output JSON schema:\n"
-        "{\n"
-        '  "category": ["Hate Speech" | "Harassment" | "Profanity" | "Violence" | '
-        '"Political Extremism" | "Misinformation" | "Racism" | "Religious Hate" | '
-        '"Threats" | "None", ...],\n'
-        '  "toxicity_level": "Low" | "Medium" | "High" | "Severe",\n'
-        '  "toxicity_type": ["Insult" | "Threat" | "Identity Attack" | "Profanity" | '
-        '"Extremist Language" | "Bullying" | "Graphic Violence" | "Political Abuse" | '
-        '"Religious Intolerance", ...],\n'
-        '  "explanation": "short reason"\n'
-        "}\n\n"
+        "1. Detect toxic or offensive language.\n"
+        "2. Assign categories (use exact strings).\n"
+        "3. Set toxicity_level (use exact strings).\n"
+        "4. Set toxicity_type (use exact strings; may be empty). \n"
+        "5. Write a concise explanation.\n\n"
+        "VALID JSON OUTPUT ONLY — no Markdown, no code fences.\n"
+        "Use commas between array elements. NEVER use '|' characters in arrays.\n"
+        "\n"
+        'Example (shape only): {"category":["None"],"toxicity_level":"Low",'
+        '"toxicity_type":[],"explanation":"..."}\n\n'
+        "Allowed category values exactly one of:\n"
+        f"{cats}.\n"
+        f"Toxicity level must be one of: {levels}.\n"
+        f"Toxicity type values (zero or more) from: {types_ex}.\n\n"
         "Text:\n"
         f"{text}"
     )
 
 
-def _parse_json_object(text: str) -> dict[str, Any]:
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
+def _repair_schema_union_in_arrays(blob: str) -> str:
+    """Fix invalid JSON where the model echoed schema notation like '\"A\" | \"B\"'."""
+    out = blob
+    for key in ("category", "toxicity_type"):
 
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        raise ToxicityModelError(f"Model did not return JSON. Output: {text[:800]}")
-    try:
-        obj = json.loads(m.group(0))
-    except Exception as exc:
-        raise ToxicityModelError(f"Failed to parse model JSON. Output: {text[:800]}") from exc
-    if not isinstance(obj, dict):
-        raise ToxicityModelError(f"Model JSON was not an object. Output: {text[:800]}")
-    return obj
+        def repl(mm: re.Match) -> str:
+            inner = mm.group(2)
+            inner = re.sub(r'"\s*\|\s*"', '", "', inner)
+            return f"{mm.group(1)}[{inner}]"
+
+        out = re.sub(rf'("{re.escape(key)}"\s*:\s*)\[(.*?)\]', repl, out, flags=re.DOTALL)
+    return out
+
+
+def _fallback_parse_classification_dict(raw: str) -> dict[str, Any]:
+    """Last resort: regex-extract JSON-like fields after model hallucinates invalid JSON."""
+    out: dict[str, Any] = {}
+    lvl = re.search(r'"toxicity_level"\s*:\s*"([^"]*)"', raw)
+    if lvl:
+        out["toxicity_level"] = lvl.group(1)
+    for ak in ("category", "toxicity_type"):
+        am = re.search(rf'"{ak}"\s*:\s*\[(.*?)\]\s*(?:,|\}})', raw, re.DOTALL)
+        if not am:
+            am = re.search(rf'"{ak}"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+        if am:
+            inner = re.sub(r'"\s*\|\s*"', '", "', am.group(1))
+            quoted = [q for q in re.findall(r'"([^"]*)"', inner) if q.strip()]
+            if quoted:
+                out[ak] = quoted
+    em = re.search(r'"explanation"\s*:\s*"(.*?)"\s*\}\s*$', raw, flags=re.DOTALL)
+    if not em:
+        em = re.search(r'"explanation"\s*:\s*"(.*)"', raw, flags=re.DOTALL)
+    if em:
+        out["explanation"] = em.group(1).strip()
+    return out
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    t = text.strip()
+    blobs: list[str] = []
+    blobs.append(t)
+    m_obj = re.search(r"\{[\s\S]*\}", t)
+    if m_obj:
+        blobs.append(m_obj.group(0))
+
+    tries: list[str] = []
+    for b in blobs:
+        tries.append(b)
+        tries.append(_repair_schema_union_in_arrays(b))
+
+    last_err: Exception | None = None
+    seen: set[str] = set()
+    for cand in tries:
+        cand = cand.strip()
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    loose = _fallback_parse_classification_dict(m_obj.group(0) if m_obj else t)
+    if loose.get("toxicity_level") or loose.get("category") or loose.get("explanation"):
+        return loose
+
+    detail = (
+        f"Failed to parse model JSON. Raw output truncated:\n{text[:1600]}..."
+        if len(text) > 1600
+        else f"Failed to parse model JSON. Raw output:\n{text}"
+    )
+    if last_err is not None:
+        raise ToxicityModelError(detail) from last_err
+    raise ToxicityModelError(detail)
 
 
 def _normalize_level(value: Any, *, allowed: Iterable[str], fallback: str) -> str:

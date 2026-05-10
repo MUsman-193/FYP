@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
@@ -19,7 +20,8 @@ from moderation import (
     LocalToxicityAnalyzer,
     ProfanitySanitizer,
     ProfanityScanner,
-    ToxicityModelError,
+    ToxicityTextMetricsBundle,
+    preprocess_and_analyze_single,
 )
 from preprocessing import PreprocessConfig, TextPreprocessor
 
@@ -302,6 +304,12 @@ class _RoundedButton(tk.Canvas):
         h = max(34, int(18 + (self._pady * 2)))
         self.configure(width=w, height=h)
 
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.autosize()
+        if self.winfo_width() > 1 and self.winfo_height() > 1:
+            self._draw(tk.Event())
+
 
 class ToxicCommentApp:
     def __init__(self, root: Tk, *, user: UserRecord, on_logout: Callable[[], None]) -> None:
@@ -320,8 +328,9 @@ class ToxicCommentApp:
         self.augmenter = TextAugmenter(seed=42)
         self.profanity_scanner = ProfanityScanner()
         self.profanity_sanitizer = ProfanitySanitizer(self.profanity_scanner.terms)
-        # FYP model weights in project modal/ (see LocalToxicityAnalyzer). Falls back if load/inference fails.
+        # Local model weights in project model/ (see LocalToxicityAnalyzer). Falls back if load/inference fails.
         self.toxicity_analyzer = LocalToxicityAnalyzer()
+        self._toxicity_analysis_busy = False
         self.model_manager = None
         self._modeling_available = False
         self._modeling_error: str | None = None
@@ -367,13 +376,37 @@ class ToxicCommentApp:
         }
 
         self._build_ui()
-        if self._modeling_available and self.model_manager is not None:
-            self._log(self.model_manager.architecture_guidance())
-        else:
-            msg = "Modeling features unavailable (SciPy/scikit-learn not installed or incompatible)."
-            if self._modeling_error:
-                msg += f" Error: {self._modeling_error}"
-            self._log(msg)
+        # Load the local toxicity model after login (startup). This may take a bit on CPU.
+        self.root.after(50, self._warmup_local_toxicity_model)
+
+    def _warmup_local_toxicity_model(self) -> None:
+        self._log("Loading local toxicity model (background)...")
+        analyzer = self.toxicity_analyzer
+
+        def worker() -> None:
+            err: BaseException | None = None
+            try:
+                analyzer.preload()
+            except BaseException as exc:
+                err = exc
+
+            def on_main() -> None:
+                if err is not None:
+                    self._log(f"Local toxicity model failed to load: {err}")
+                    return
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        self._log(f"Local toxicity model loaded on GPU: {torch.cuda.get_device_name(0)}")
+                    else:
+                        self._log("Local toxicity model loaded on CPU.")
+                except Exception:
+                    self._log("Local toxicity model loaded.")
+
+            self.root.after(0, on_main)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_ui(self) -> None:
         # Shared design tokens (keep sidebar + right panel consistent)
@@ -945,159 +978,116 @@ class ToxicCommentApp:
         self.tox_input.insert("1.0", content)
         self._show_text_preview(content)
 
+    def _set_toxicity_analyze_loading(self, loading: bool) -> None:
+        btn = getattr(self, "analyze_btn", None)
+        if btn is None:
+            return
+        up = getattr(self, "upload_btn", None)
+        if loading:
+            self._analyze_btn_idle_label = getattr(self, "_analyze_btn_idle_label", "Analyze")
+            btn.set_text("Analyzing...")
+            btn.set_enabled(False)
+            if up is not None:
+                up.set_enabled(False)
+            self.root.update_idletasks()
+        else:
+            btn.set_text(getattr(self, "_analyze_btn_idle_label", "Analyze"))
+            btn.set_enabled(True)
+            if up is not None:
+                up.set_enabled(True)
+            self.root.update_idletasks()
+
     def _analyze_toxicity_text(self) -> None:
+        if self._toxicity_analysis_busy:
+            return
+
         text_raw = self.tox_input.get("1.0", END).strip()
         if not text_raw:
             messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
             return
 
-        try:
-            if not getattr(self, "_tox_results_visible", False):
-                # Show results UI only when analysis actually runs.
-                self._tox_results_wrap.pack(fill="x", pady=(0, 6))
-                self._tox_results_visible = True
+        if not getattr(self, "_tox_results_visible", False):
+            self._tox_results_wrap.pack(fill="x", pady=(0, 6))
+            self._tox_results_visible = True
 
-            # Same preprocessing pipeline as dataset Apply (quote fences, noise, etc.).
-            text = self.preprocessor.apply(text_raw, self._build_prep_config())
+        prep = self._build_prep_config()
+        self._toxicity_analysis_busy = True
+        self._set_toxicity_analyze_loading(True)
 
-            metrics, overall, lvl, cats, types_j, used_model, expl = self._analyze_text_for_metrics(text)
-            self._update_toxicity_ui(overall=overall, metrics=metrics)
-
-            if used_model:
-                summary = (
-                    "Toxicity Analysis Result (local model)\n"
-                    f"- Category: {cats or 'None'}\n"
-                    f"- Toxicity Level: {lvl}\n"
-                    f"- Toxicity Type: {types_j or 'None'}\n"
+        def worker() -> None:
+            bundle: ToxicityTextMetricsBundle | None = None
+            err: BaseException | None = None
+            try:
+                bundle = preprocess_and_analyze_single(
+                    text_raw,
+                    preprocessor=self.preprocessor,
+                    prep_config=prep,
+                    toxicity_analyzer=self.toxicity_analyzer,
                 )
-                if expl:
-                    summary += f"- Explanation: {expl}\n"
-                summary += (
-                    f"- UI Score (derived): {overall}%\n"
-                    f"  - Toxicity: {metrics['Toxicity']}%\n"
-                    f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
-                    f"  - Identity Attack: {metrics['Identity Attack']}%\n"
-                    f"  - Insult: {metrics['Insult']}%\n"
-                    f"  - Profanity: {metrics['Profanity']}%\n"
-                    f"  - Threat: {metrics['Threat']}%"
-                )
-                self._log_toxicity_summary(summary, overall)
-            else:
-                hf_summary = (
-                    "Toxicity Analysis Result (heuristic fallback)\n"
-                    f"- UI Score (derived): {overall}%\n"
-                    f"  - Toxicity: {metrics['Toxicity']}%\n"
-                    f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
-                    f"  - Identity Attack: {metrics['Identity Attack']}%\n"
-                    f"  - Insult: {metrics['Insult']}%\n"
-                    f"  - Profanity: {metrics['Profanity']}%\n"
-                    f"  - Threat: {metrics['Threat']}%"
-                )
-                self._log_toxicity_summary(hf_summary, overall)
-                self._log("Local toxicity model unavailable; used heuristic fallback for this analysis.")
-
-            self._record_single_run(
-                text_raw=text_raw,
-                overall=overall,
-                metrics=metrics,
-                summary_line=(
-                    "Single: "
-                    f"top={max(metrics.items(), key=lambda kv: int(kv[1]))[0]} "
-                    f"({max((int(v) for v in metrics.values()), default=0)}%) "
-                    f"level={lvl}"
-                ),
+            except BaseException as exc:
+                err = exc
+            br, er = bundle, err
+            self.root.after(
+                0,
+                lambda tr=text_raw, bb=br, ee=er: self._complete_single_analyze_ui(tr, bb, ee),
             )
-        except Exception as exc:
-            messagebox.showerror("Analyze Error", str(exc))
-            self._log(f"Analyze Error: {exc}")
-            return
 
-    def _metrics_from_llm_analysis(
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _complete_single_analyze_ui(
         self,
-        *,
-        toxicity_level: str,
-        toxicity_types: list[str],
-    ) -> tuple[dict[str, int], int]:
-        # Convert model labels to the existing UI's 6 metrics.
-        lvl = (toxicity_level or "").strip().lower()
-        base = {"low": 20, "medium": 55, "high": 80, "severe": 95}.get(lvl, 40)
-        severe = {"low": 0, "medium": 35, "high": 70, "severe": 95}.get(lvl, 30)
+        text_raw: str,
+        bundle: ToxicityTextMetricsBundle | None,
+        err: BaseException | None,
+    ) -> None:
+        """Apply analysis on the Tk main thread after background work completes."""
+        self._toxicity_analysis_busy = False
+        self._set_toxicity_analyze_loading(False)
+        if err is not None:
+            messagebox.showerror("Analyze Error", str(err))
+            self._log(f"Analyze Error: {err}")
+            return
+        assert bundle is not None
 
-        types = {t.strip().lower(): t for t in (toxicity_types or []) if t and t.strip()}
-        identity = 85 if "identity attack" in types else 0
-        threat = 85 if "threat" in types else 0
-        profanity = 80 if "profanity" in types else 0
-        insult = 70 if ("insult" in types or "bullying" in types or "political abuse" in types) else 0
+        metrics = bundle.metrics
+        overall = bundle.overall
+        lvl = bundle.lvl
+        cats = bundle.cats_csv
+        types_j = bundle.types_csv
+        expl = bundle.explanation
 
-        # If the model says it's toxic but didn't name any type, keep something non-zero.
-        if base >= 55 and max(identity, threat, profanity, insult) == 0:
-            insult = 55
+        self._update_toxicity_ui(overall=overall, metrics=metrics)
 
-        metrics = {
-            "Toxicity": int(max(0, min(100, base))),
-            "Severe Toxicity": int(max(0, min(100, severe))),
-            "Identity Attack": int(max(0, min(100, identity))),
-            "Insult": int(max(0, min(100, insult))),
-            "Profanity": int(max(0, min(100, profanity))),
-            "Threat": int(max(0, min(100, threat))),
-        }
-        overall = int(round(sum(metrics.values()) / len(metrics)))
-        return metrics, overall
+        summary = (
+            "Toxicity Analysis Result (local model)\n"
+            f"- Category: {cats or 'None'}\n"
+            f"- Toxicity Level: {lvl}\n"
+            f"- Toxicity Type: {types_j or 'None'}\n"
+        )
+        if expl:
+            summary += f"- Explanation: {expl}\n"
+        summary += (
+            f"- UI Score (derived): {overall}%\n"
+            f"  - Toxicity: {metrics['Toxicity']}%\n"
+            f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
+            f"  - Identity Attack: {metrics['Identity Attack']}%\n"
+            f"  - Insult: {metrics['Insult']}%\n"
+            f"  - Profanity: {metrics['Profanity']}%\n"
+            f"  - Threat: {metrics['Threat']}%"
+        )
+        self._log_toxicity_summary(summary, overall)
 
-    def _overall_bucket_level(self, overall: int) -> str:
-        o = max(0, min(100, int(overall)))
-        if o < 35:
-            return "Low"
-        if o < 70:
-            return "Medium"
-        if o < 90:
-            return "High"
-        return "Severe"
-
-    def _analyze_text_for_metrics(
-        self, text: str
-    ) -> tuple[dict[str, int], int, str, str, str, bool, str]:
-        """
-        Returns (metrics, overall, toxicity_level, categories_csv, types_csv, used_local_model, explanation).
-        """
-        try:
-            analysis = self.toxicity_analyzer.analyze(text)
-            metrics, overall = self._metrics_from_llm_analysis(
-                toxicity_level=analysis.toxicity_level,
-                toxicity_types=analysis.toxicity_type,
-            )
-            cats = ", ".join(analysis.category) if analysis.category else ""
-            types_j = ", ".join(analysis.toxicity_type) if analysis.toxicity_type else ""
-            expl = (analysis.explanation or "").strip()
-            return (
-                metrics,
-                overall,
-                analysis.toxicity_level,
-                cats,
-                types_j,
-                True,
-                expl,
-            )
-        except ToxicityModelError:
-            scan = self.profanity_scanner.scan_text(text)
-            prof = int(scan.profanity_count)
-            toxic = min(100, prof * 15)
-            severe = 0 if prof == 0 else min(100, max(0, (prof - 2) * 18))
-            identity = 0
-            insult = min(100, prof * 6)
-            profanity = min(100, prof * 20)
-            threat = 0
-            metrics = {
-                "Toxicity": toxic,
-                "Severe Toxicity": severe,
-                "Identity Attack": identity,
-                "Insult": insult,
-                "Profanity": profanity,
-                "Threat": threat,
-            }
-            overall = int(round(sum(metrics.values()) / len(metrics)))
-            lvl = self._overall_bucket_level(overall)
-            return metrics, overall, lvl, "", "", False, ""
+        self._record_single_run(
+            text_raw=text_raw,
+            overall=overall,
+            metrics=metrics,
+            summary_line=(
+                "Single: "
+                f"top={max(metrics.items(), key=lambda kv: int(kv[1]))[0]} "
+                f"({max((int(v) for v in metrics.values()), default=0)}%) "
+                f"level={lvl}"
+            ),
+        )
 
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
         overall = max(0, min(100, int(overall)))
