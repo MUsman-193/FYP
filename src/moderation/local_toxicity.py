@@ -218,28 +218,99 @@ class LocalToxicityAnalyzer:
         if not content:
             raise ToxicityModelError("Model returned empty output.")
 
-        parsed = _parse_json_object(content)
-        if "toxicity_type" not in parsed and isinstance(parsed.get("toxicity_types"), list):
-            parsed["toxicity_type"] = parsed.get("toxicity_types")
-        category = _normalize_list(parsed.get("category"), allowed=_DEFAULT_CATEGORIES, fallback=["None"])
-        # Some generations echo almost every schema category; infer from toxicity_type instead.
-        if len(category) >= 9:
-            candidate = _infer_category_from_raw_types(parsed.get("toxicity_type"))
-            category = _normalize_list([candidate], allowed=_DEFAULT_CATEGORIES, fallback=["None"])
-        toxicity_level = _normalize_level(parsed.get("toxicity_level"), allowed=_DEFAULT_LEVELS, fallback="Low")
-        tox_types = _normalize_toxicity_types(parsed.get("toxicity_type"))
-        # Model sometimes lists most of the enum; treat as non-specific.
-        if len(tox_types) >= max(5, len(_DEFAULT_TYPES) - 2):
-            tox_types = []
-        explanation = str(parsed.get("explanation") or "").strip()
+        return _analysis_from_parsed(_parse_json_object(content), raw_model_output=content)
 
-        return ToxicityAnalysis(
-            category=category,
-            toxicity_level=toxicity_level,
-            toxicity_type=tox_types,
-            explanation=explanation,
-            raw_model_output=content,
+    def token_budgeted_batches(
+        self,
+        items: list[tuple[int, str]],
+        *,
+        max_rows_per_batch: int = 24,
+    ) -> list[list[tuple[int, str]]]:
+        self._ensure_loaded()
+        assert self._tokenizer is not None and self._model is not None
+
+        context_window = _model_context_window(self._model, self._tokenizer)
+        prompt_overhead = 900
+        output_reserve = max(512, min(4096, int(context_window * 0.25)))
+        input_budget = max(512, int(context_window * 0.70) - prompt_overhead - output_reserve)
+
+        batches: list[list[tuple[int, str]]] = []
+        cur: list[tuple[int, str]] = []
+        cur_tokens = 0
+        for row_id, text in items:
+            clean = str(text).strip()
+            if not clean:
+                continue
+            token_count = len(self._tokenizer.encode(clean, add_special_tokens=False))
+            token_count = max(1, token_count + 16)
+            if cur and (cur_tokens + token_count > input_budget or len(cur) >= max_rows_per_batch):
+                batches.append(cur)
+                cur = []
+                cur_tokens = 0
+            cur.append((row_id, clean))
+            cur_tokens += token_count
+        if cur:
+            batches.append(cur)
+        return batches
+
+    def analyze_batch(self, items: list[tuple[int, str]]) -> list[tuple[int, ToxicityAnalysis]]:
+        if not items:
+            return []
+
+        self._ensure_loaded()
+        assert self._tokenizer is not None and self._model is not None and self._device is not None
+
+        import torch
+
+        prompt = (
+            "You are a content moderation classifier. Return ONLY valid JSON. No markdown.\n\n"
+            + _build_batch_prompt(items)
+            + "\n\nJSON:"
         )
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
+        max_new_tokens = max(512, min(4096, len(items) * 120))
+
+        try:
+            with torch.no_grad():
+                out = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    repetition_penalty=1.08,
+                    pad_token_id=(
+                        self._tokenizer.pad_token_id
+                        if self._tokenizer.pad_token_id is not None
+                        else self._tokenizer.eos_token_id
+                    ),
+                )
+        except Exception as exc:
+            raise ToxicityModelError(f"Batch model generation failed: {exc}") from exc
+
+        gen_ids = out[0, inputs.input_ids.shape[1] :]
+        content = self._tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        parsed = _parse_json_array(content)
+        expected = {int(row_id) for row_id, _ in items}
+        out_items: list[tuple[int, ToxicityAnalysis]] = []
+        seen: set[int] = set()
+        for obj in parsed:
+            if not isinstance(obj, dict):
+                continue
+            try:
+                row_id = int(obj.get("row_id"))
+            except Exception:
+                continue
+            if row_id not in expected or row_id in seen:
+                continue
+            seen.add(row_id)
+            out_items.append((row_id, _analysis_from_parsed(obj, raw_model_output=content)))
+
+        if seen != expected:
+            missing = sorted(expected - seen)
+            raise ToxicityModelError(
+                "Batch output did not include every requested row. "
+                f"Missing rows: {missing[:8]}{'...' if len(missing) > 8 else ''}"
+            )
+        return out_items
 
 
 def _infer_category_from_raw_types(types_val: Any) -> str:
@@ -299,6 +370,47 @@ def _build_prompt(text: str) -> str:
         "Message to classify:\n"
         f"{text}"
     )
+
+
+def _build_batch_prompt(items: list[tuple[int, str]]) -> str:
+    cats = ", ".join(_DEFAULT_CATEGORIES)
+    types_ex = ", ".join(_DEFAULT_TYPES)
+    levels = ", ".join(_DEFAULT_LEVELS)
+    lines = []
+    for row_id, text in items:
+        clean = str(text).replace("\r", " ").replace("\n", " ").strip()
+        lines.append(f"{int(row_id)}: {clean}")
+    return (
+        "Classify each numbered message for moderation.\n\n"
+        "Respond with ONE JSON array. The array must contain exactly one object for each input row.\n"
+        "Each object must have exactly these keys: "
+        '"row_id", "category", "toxicity_level", "toxicity_type", "explanation".\n\n'
+        "Rules:\n"
+        "- Do not skip rows and do not add extra rows.\n"
+        "- Keep explanations very short.\n"
+        "- Arrays must stay short: category <= 3, toxicity_type <= 4.\n"
+        '- If text is fine, use category ["None"], level "Low", toxicity_type [].\n\n'
+        f"Allowed category strings: {cats}.\n"
+        f"Allowed levels: {levels}.\n"
+        f"Optional toxicity_type strings: {types_ex}.\n\n"
+        "Example shape:\n"
+        '[{"row_id":1,"category":["None"],"toxicity_level":"Low","toxicity_type":[],"explanation":"No harm detected."}]\n\n'
+        "Messages:\n"
+        + "\n".join(lines)
+    )
+
+
+def _model_context_window(model: Any, tokenizer: Any) -> int:
+    candidates: list[int] = []
+    model_max = getattr(tokenizer, "model_max_length", None)
+    if isinstance(model_max, int) and 0 < model_max < 1_000_000:
+        candidates.append(model_max)
+    cfg = getattr(model, "config", None)
+    for name in ("max_position_embeddings", "seq_length", "n_positions"):
+        val = getattr(cfg, name, None)
+        if isinstance(val, int) and val > 0:
+            candidates.append(val)
+    return min(candidates) if candidates else 4096
 
 
 def _brace_balanced_object(s: str, open_brace: int) -> str | None:
@@ -440,6 +552,58 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if last_err is not None:
         raise ToxicityModelError(detail) from last_err
     raise ToxicityModelError(detail)
+
+
+def _parse_json_array(text: str) -> list[Any]:
+    t = text.strip()
+    candidates = [t]
+    m_arr = re.search(r"\[[\s\S]*\]", t)
+    if m_arr:
+        candidates.insert(0, m_arr.group(0))
+
+    last_err: Exception | None = None
+    for cand in candidates:
+        try:
+            parsed = json.loads(cand)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                return parsed["results"]
+        except Exception as exc:
+            last_err = exc
+
+    detail = (
+        f"Failed to parse batch JSON. Raw output truncated:\n{text[:1600]}..."
+        if len(text) > 1600
+        else f"Failed to parse batch JSON. Raw output:\n{text}"
+    )
+    if last_err is not None:
+        raise ToxicityModelError(detail) from last_err
+    raise ToxicityModelError(detail)
+
+
+def _analysis_from_parsed(parsed: dict[str, Any], *, raw_model_output: str) -> ToxicityAnalysis:
+    if "toxicity_type" not in parsed and isinstance(parsed.get("toxicity_types"), list):
+        parsed["toxicity_type"] = parsed.get("toxicity_types")
+    category = _normalize_list(parsed.get("category"), allowed=_DEFAULT_CATEGORIES, fallback=["None"])
+    # Some generations echo almost every schema category; infer from toxicity_type instead.
+    if len(category) >= 9:
+        candidate = _infer_category_from_raw_types(parsed.get("toxicity_type"))
+        category = _normalize_list([candidate], allowed=_DEFAULT_CATEGORIES, fallback=["None"])
+    toxicity_level = _normalize_level(parsed.get("toxicity_level"), allowed=_DEFAULT_LEVELS, fallback="Low")
+    tox_types = _normalize_toxicity_types(parsed.get("toxicity_type"))
+    # Model sometimes lists most of the enum; treat as non-specific.
+    if len(tox_types) >= max(5, len(_DEFAULT_TYPES) - 2):
+        tox_types = []
+    explanation = str(parsed.get("explanation") or "").strip()
+
+    return ToxicityAnalysis(
+        category=category,
+        toxicity_level=toxicity_level,
+        toxicity_type=tox_types,
+        explanation=explanation,
+        raw_model_output=raw_model_output,
+    )
 
 
 def _coerce_toxicity_type_token(raw: str) -> str | None:

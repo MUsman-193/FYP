@@ -6,6 +6,7 @@ from pathlib import Path
 import gc
 import io
 import threading
+import time
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
 import tkinter as tk
@@ -22,7 +23,9 @@ from moderation import (
     LocalToxicityAnalyzer,
     ProfanitySanitizer,
     ProfanityScanner,
+    ToxicityAnalysis,
     ToxicityTextMetricsBundle,
+    metrics_from_llm_prediction,
     preprocess_and_analyze_single,
 )
 from preprocessing import PreprocessConfig, TextPreprocessor
@@ -377,6 +380,9 @@ class ToxicCommentApp:
         # Local model weights in project model/ (see LocalToxicityAnalyzer). Falls back if load/inference fails.
         self.toxicity_analyzer = LocalToxicityAnalyzer()
         self._toxicity_analysis_busy = False
+        self._toxicity_model_ready = False
+        self._toxicity_cancel_event = threading.Event()
+        self._toxicity_download_payload: str | None = None
         self.model_manager = None
         self._modeling_available = False
         self._modeling_error: str | None = None
@@ -438,8 +444,11 @@ class ToxicCommentApp:
 
             def on_main() -> None:
                 if err is not None:
+                    self._toxicity_model_ready = False
                     self._log(f"Local toxicity model failed to load: {err}")
                     return
+                self._toxicity_model_ready = True
+                self._set_toxicity_analyze_ready()
                 try:
                     import torch
 
@@ -765,6 +774,22 @@ class ToxicCommentApp:
             fg=self._tox_text,
         ).pack(side="left")
 
+        self.toxicity_download_btn = _RoundedButton(
+            header_inner,
+            text="Download",
+            bg="#ffffff",
+            fg=self._tox_text,
+            command=self._download_toxicity_analysis,
+            border=self._tox_border,
+            radius=12,
+            hover_bg="#f3f4f6",
+            active_bg="#e5e7eb",
+            canvas_bg=self._tox_bg,
+            enabled=False,
+        )
+        self.toxicity_download_btn.autosize()
+        self.toxicity_download_btn.pack(side="right")
+
         scroll_host = tk.Frame(parent, bg=self._tox_bg)
         scroll_host.pack(fill="both", expand=True)
 
@@ -852,7 +877,23 @@ class ToxicCommentApp:
             active_bg=self._tox_blue,
         )
         self.analyze_btn.autosize()
+        self.analyze_btn.set_enabled(False)
         self.analyze_btn.grid(row=0, column=0, sticky="we", padx=(0, 10))
+
+        self.cancel_analysis_btn = _RoundedButton(
+            actions,
+            text="Cancel",
+            bg="#ffffff",
+            fg="#b91c1c",
+            command=self._cancel_toxicity_analysis,
+            border="#fecaca",
+            radius=12,
+            hover_bg="#fef2f2",
+            active_bg="#fee2e2",
+            enabled=False,
+        )
+        self.cancel_analysis_btn.autosize()
+        self.cancel_analysis_btn.grid(row=0, column=1, sticky="e", padx=(0, 10))
 
         self.upload_btn = _RoundedButton(
             actions,
@@ -866,7 +907,7 @@ class ToxicCommentApp:
             active_bg="#e5e7eb",
         )
         self.upload_btn.autosize()
-        self.upload_btn.grid(row=0, column=1, sticky="e")
+        self.upload_btn.grid(row=0, column=2, sticky="e")
 
         # Results area (HIDDEN until user clicks Analyze)
         self._tox_results_wrap = tk.Frame(body, bg=self._tox_bg)
@@ -1017,9 +1058,7 @@ class ToxicCommentApp:
     def _upload_toxicity_file(self) -> None:
         path = filedialog.askopenfilename(
             filetypes=[
-                ("Datasets", "*.csv *.xlsx *.xls *.json"),
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
+                ("Text datasets", "*.txt"),
             ]
         )
         if not path:
@@ -1027,6 +1066,11 @@ class ToxicCommentApp:
         p = Path(path)
         self._dataset_path = p
         self.file_var.set(p.name)
+
+        # Treat .txt uploads as row-based datasets: one line = one comment to analyze.
+        if p.suffix.lower() == ".txt":
+            self._load_text_dataset_path(p)
+            return
 
         # If it's a dataset, load it and show in the shared Preview section.
         if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".json"}:
@@ -1044,23 +1088,94 @@ class ToxicCommentApp:
         self.tox_input.insert("1.0", content)
         self._show_text_preview(content)
 
+    def _load_text_dataset_path(self, path: Path) -> None:
+        if not path.exists():
+            messagebox.showerror("Error", "Please select a valid text file.")
+            return
+        self._dataset_path = path
+        self.file_var.set(path.name)
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
+            return
+
+        rows = content.splitlines()
+        self.df = pd.DataFrame({"comment_text": rows})
+        self.text_col_var.set("comment_text")
+        self.label_col_var.set("")
+        self._show_preview(self.df)
+        self._log(f"Loaded text dataset with {len(rows):,} rows from file: {path.name}")
+        self._log("Text analysis mode: one line is treated as one row/comment.")
+        self._scan_profanity()
+
+    def _set_toxicity_download_ready(self, payload: str | None) -> None:
+        self._toxicity_download_payload = payload
+        btn = getattr(self, "toxicity_download_btn", None)
+        if btn is not None:
+            btn.set_enabled(bool(payload))
+
+    def _download_toxicity_analysis(self) -> None:
+        payload = (self._toxicity_download_payload or "").strip()
+        if not payload:
+            messagebox.showerror("Download", "Run an analysis before exporting.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save toxicity analysis",
+            initialfile="toxicity_analysis.txt",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(payload, encoding="utf-8")
+            self._log(f"Saved toxicity analysis to {path}")
+        except Exception as exc:
+            messagebox.showerror("Download", str(exc))
+
+    def _cancel_toxicity_analysis(self) -> None:
+        if not self._toxicity_analysis_busy:
+            return
+        self._toxicity_cancel_event.set()
+        btn = getattr(self, "cancel_analysis_btn", None)
+        if btn is not None:
+            btn.set_text("Cancelling...")
+            btn.set_enabled(False)
+        self._log("Cancel requested. Analysis will stop after the current row finishes.")
+
+    def _set_toxicity_analyze_ready(self) -> None:
+        btn = getattr(self, "analyze_btn", None)
+        if btn is not None and not self._toxicity_analysis_busy:
+            btn.set_text(getattr(self, "_analyze_btn_idle_label", "Analyze"))
+            btn.set_enabled(self._toxicity_model_ready)
+
     def _set_toxicity_analyze_loading(self, loading: bool) -> None:
         btn = getattr(self, "analyze_btn", None)
         if btn is None:
             return
         up = getattr(self, "upload_btn", None)
+        cancel = getattr(self, "cancel_analysis_btn", None)
         if loading:
             self._analyze_btn_idle_label = getattr(self, "_analyze_btn_idle_label", "Analyze")
             btn.set_text("Analyzing...")
             btn.set_enabled(False)
             if up is not None:
                 up.set_enabled(False)
+            if cancel is not None:
+                cancel.set_text("Cancel")
+                cancel.set_enabled(True)
+            self._set_toxicity_download_ready(None)
             self.root.update_idletasks()
         else:
             btn.set_text(getattr(self, "_analyze_btn_idle_label", "Analyze"))
-            btn.set_enabled(True)
+            btn.set_enabled(self._toxicity_model_ready)
             if up is not None:
                 up.set_enabled(True)
+            if cancel is not None:
+                cancel.set_text("Cancel")
+                cancel.set_enabled(False)
             self.root.update_idletasks()
 
     def _text_for_single_toxicity_analyze(self, text_raw: str) -> tuple[str, str | None]:
@@ -1116,8 +1231,228 @@ class ToxicCommentApp:
         except Exception:
             return s, None
 
+    def _analyze_dataset_records(
+        self,
+        *,
+        records: list[tuple[int, str]],
+        source_col: str,
+        prep: PreprocessConfig,
+    ) -> dict[str, object]:
+        total_rows = len(records)
+        metric_sums = {name: 0 for name in _HISTORY_METRIC_ORDER}
+        overall_sum = 0
+        analyzed = 0
+        skipped = 0
+        errors: list[str] = []
+        row_lines = [
+            "row_number\toverall\ttoxicity\tsevere_toxicity\tidentity_attack\tinsult\tprofanity\tthreat\tlevel\tcategory\ttoxicity_type\ttext_preview"
+        ]
+        top_examples: list[tuple[int, int, str]] = []
+        progress_every = max(1, min(100, total_rows // 20))
+        started_at = time.monotonic()
+        cancelled = False
+        processed_positions = 0
+        prepared_records: list[tuple[int, str, str]] = []
+        for row_number, text in records:
+            raw = str(text).strip()
+            if raw:
+                prepared_records.append((row_number, raw, self.preprocessor.apply(raw, prep)))
+            else:
+                skipped += 1
+
+        batches = self.toxicity_analyzer.token_budgeted_batches(
+            [(row_number, processed) for row_number, _raw, processed in prepared_records]
+        )
+        raw_by_row = {row_number: raw for row_number, raw, _processed in prepared_records}
+        self.root.after(
+            0,
+            lambda batch_count=len(batches), row_count=len(prepared_records): self._log(
+                f"Batch mode enabled: {row_count:,} non-empty rows packed into {batch_count:,} model calls."
+            ),
+        )
+
+        def handle_result(row_number: int, raw: str, analysis: ToxicityAnalysis) -> None:
+            nonlocal analyzed, overall_sum, top_examples
+            metrics, overall = metrics_from_llm_prediction(
+                toxicity_level=analysis.toxicity_level,
+                toxicity_types=list(analysis.toxicity_type),
+                categories=list(analysis.category),
+            )
+            analyzed += 1
+            overall_sum += int(overall)
+            for metric_name in _HISTORY_METRIC_ORDER:
+                metric_sums[metric_name] += int(metrics.get(metric_name, 0))
+
+            preview = raw.replace("\n", " ").replace("\t", " ")[:180]
+            cats = ", ".join(analysis.category) if analysis.category else "None"
+            types = ", ".join(analysis.toxicity_type) if analysis.toxicity_type else "None"
+            row_lines.append(
+                "\t".join(
+                    [
+                        str(row_number),
+                        str(int(overall)),
+                        str(int(metrics["Toxicity"])),
+                        str(int(metrics["Severe Toxicity"])),
+                        str(int(metrics["Identity Attack"])),
+                        str(int(metrics["Insult"])),
+                        str(int(metrics["Profanity"])),
+                        str(int(metrics["Threat"])),
+                        str(analysis.toxicity_level),
+                        cats,
+                        types,
+                        preview,
+                    ]
+                )
+            )
+            top_examples.append((int(overall), row_number, preview))
+            top_examples = sorted(top_examples, key=lambda item: item[0], reverse=True)[:5]
+
+        for batch_index, batch in enumerate(batches, start=1):
+            if self._toxicity_cancel_event.is_set():
+                cancelled = True
+                break
+            first_row = batch[0][0] if batch else 0
+            batch_size = len(batch)
+            if processed_positions == 0 or processed_positions % progress_every == 0:
+                elapsed = max(0.001, time.monotonic() - started_at)
+                pct = (processed_positions / total_rows) * 100 if total_rows else 100.0
+                rate = processed_positions / elapsed
+                self.root.after(
+                    0,
+                    lambda row=first_row,
+                    done=processed_positions,
+                    total=total_rows,
+                    percent=pct,
+                    ok=analyzed,
+                    fail=len(errors),
+                    seconds=elapsed,
+                    rps=rate,
+                    bi=batch_index,
+                    bs=batch_size: self._log(
+                        f"Dataset analysis {percent:.2f}% complete "
+                        f"({done:,}/{total:,} rows checked, batch {bi:,} size {bs:,}, starting row {row:,}, "
+                        f"{ok:,} analyzed, {fail:,} errors, {seconds/60:.1f} min, {rps:.2f} rows/sec)"
+                    ),
+                )
+            try:
+                for row_number, analysis in self.toxicity_analyzer.analyze_batch(batch):
+                    handle_result(row_number, raw_by_row.get(row_number, ""), analysis)
+            except Exception as exc:
+                errors.append(
+                    f"Batch {batch_index} ({len(batch)} rows) failed; falling back row-by-row: {exc}"
+                )
+                for row_number, processed in batch:
+                    if self._toxicity_cancel_event.is_set():
+                        cancelled = True
+                        break
+                    try:
+                        analysis = self.toxicity_analyzer.analyze(processed)
+                        handle_result(row_number, raw_by_row.get(row_number, ""), analysis)
+                    except Exception as row_exc:
+                        errors.append(f"Row {row_number}: {row_exc}")
+                if cancelled:
+                    break
+
+            processed_positions += len(batch)
+
+            if self._toxicity_cancel_event.is_set():
+                cancelled = True
+                break
+
+            if processed_positions == len(prepared_records) or processed_positions % progress_every == 0:
+                elapsed = max(0.001, time.monotonic() - started_at)
+                pct = (processed_positions / total_rows) * 100 if total_rows else 100.0
+                rate = processed_positions / elapsed
+                self.root.after(
+                    0,
+                    lambda done=processed_positions,
+                    total=total_rows,
+                    percent=pct,
+                    ok=analyzed,
+                    fail=len(errors),
+                    seconds=elapsed,
+                    rps=rate: self._log(
+                        f"Dataset analysis progress: {percent:.2f}% complete "
+                        f"({done:,}/{total:,} rows checked, {ok:,} analyzed, {fail:,} errors, "
+                        f"{seconds/60:.1f} min, {rps:.2f} rows/sec)"
+                    ),
+                )
+
+        if analyzed <= 0:
+            raise ValueError("No non-empty text rows could be analyzed.")
+
+        avg_metrics = {
+            name: int(round(metric_sums[name] / analyzed))
+            for name in _HISTORY_METRIC_ORDER
+        }
+        avg_overall = int(round(overall_sum / analyzed))
+        toxic_count = sum(
+            1
+            for line in row_lines[1:]
+            if max(int(part) for part in line.split("\t")[1:8]) >= 20
+        )
+        non_toxic_count = analyzed - toxic_count
+
+        summary = (
+            "Dataset Toxicity Analysis Result (local model)\n"
+            f"- Source file: {self._dataset_path.name if self._dataset_path else 'dataset'}\n"
+            f"- Text column: {source_col}\n"
+            f"- Status: {'Cancelled by user' if cancelled else 'Completed'}\n"
+            f"- Rows in dataset: {total_rows:,}\n"
+            f"- Comments analyzed: {analyzed:,}\n"
+            f"- Empty/skipped rows: {skipped:,}\n"
+            f"- Rows with errors: {len(errors):,}\n"
+            f"- Toxic comments: {toxic_count:,}\n"
+            f"- Non-toxic comments: {non_toxic_count:,}\n"
+            f"- Average UI Score: {avg_overall}%\n"
+            f"  - Toxicity: {avg_metrics['Toxicity']}%\n"
+            f"  - Severe Toxicity: {avg_metrics['Severe Toxicity']}%\n"
+            f"  - Identity Attack: {avg_metrics['Identity Attack']}%\n"
+            f"  - Insult: {avg_metrics['Insult']}%\n"
+            f"  - Profanity: {avg_metrics['Profanity']}%\n"
+            f"  - Threat: {avg_metrics['Threat']}%"
+        )
+        if top_examples:
+            summary += "\n\nTop toxic examples:"
+            for overall, row_number, preview in top_examples:
+                summary += f"\n- Row {row_number} ({overall}%): {preview}"
+        if errors:
+            summary += "\n\nRows that failed:"
+            for err in errors[:20]:
+                summary += f"\n- {err}"
+            if len(errors) > 20:
+                summary += f"\n- ... {len(errors) - 20:,} more"
+
+        scores_line = _format_history_scores_line(overall=avg_overall, metrics=avg_metrics)
+        download_payload = f"{scores_line}\n{summary}\n\nRow results:\n" + "\n".join(row_lines)
+        return {
+            "overall": avg_overall,
+            "metrics": avg_metrics,
+            "summary": summary,
+            "download_payload": download_payload,
+            "row_count": analyzed,
+            "toxic_count": toxic_count,
+            "non_toxic_count": non_toxic_count,
+            "cancelled": cancelled,
+        }
+
+    def _set_dataset_analysis_pending_ui(self) -> None:
+        self.overall_pct_label.configure(text="...", fg=self._tox_muted, bg=self._tox_green_bg)
+        self.overall_badge.configure(text="Analyzing full dataset", fg=self._tox_muted, bg=self._tox_green_bg)
+        self._overall_score_title_label.configure(bg=self._tox_green_bg, fg=self._tox_muted)
+        self._overall_score_card.set_card_background(self._tox_green_bg)
+
+        for widget_map in self.metric_widgets.values():
+            pct_label: tk.Label = widget_map["pct"]  # type: ignore[assignment]
+            fill: tk.Frame = widget_map["bar_fill"]  # type: ignore[assignment]
+            pct_label.configure(text="...")
+            fill.configure(width=0)
+
     def _analyze_toxicity_text(self) -> None:
         if self._toxicity_analysis_busy:
+            return
+        if not self._toxicity_model_ready:
+            messagebox.showinfo("Analyze", "Please wait until the local toxicity model finishes loading.")
             return
 
         text_raw = self.tox_input.get("1.0", END).strip()
@@ -1125,15 +1460,51 @@ class ToxicCommentApp:
             messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
             return
 
-        analyzed_text, extract_note = self._text_for_single_toxicity_analyze(text_raw)
-
         if not getattr(self, "_tox_results_visible", False):
             self._tox_results_wrap.pack(fill="x", pady=(0, 6))
             self._tox_results_visible = True
 
         prep = self._build_prep_config()
         self._toxicity_analysis_busy = True
+        self._toxicity_cancel_event.clear()
         self._set_toxicity_analyze_loading(True)
+
+        is_dataset_preview = self.df is not None and text_raw.startswith("Dataset:") and "\n\n" in text_raw
+        if is_dataset_preview:
+            text_col = self.text_col_var.get().strip()
+            if text_col not in self.df.columns:
+                self._toxicity_analysis_busy = False
+                self._set_toxicity_analyze_loading(False)
+                messagebox.showerror("Analyze Error", "Please select or load a valid text column.")
+                return
+
+            records = [
+                (idx + 1, value)
+                for idx, value in enumerate(self.df[text_col].fillna("").astype(str).tolist())
+            ]
+            self._set_dataset_analysis_pending_ui()
+            self._log(
+                f"Dataset analysis started: analyzing all {len(records):,} rows from column '{text_col}'."
+            )
+
+            def dataset_worker() -> None:
+                result: dict[str, object] | None = None
+                err: BaseException | None = None
+                try:
+                    result = self._analyze_dataset_records(
+                        records=records,
+                        source_col=text_col,
+                        prep=prep,
+                    )
+                except BaseException as exc:
+                    err = exc
+                rr, ee = result, err
+                self.root.after(0, lambda r=rr, e=ee: self._complete_dataset_analyze_ui(r, e))
+
+            threading.Thread(target=dataset_worker, daemon=True).start()
+            return
+
+        analyzed_text, extract_note = self._text_for_single_toxicity_analyze(text_raw)
         if extract_note:
             self._log(extract_note)
 
@@ -1156,6 +1527,42 @@ class ToxicCommentApp:
             )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _complete_dataset_analyze_ui(
+        self,
+        result: dict[str, object] | None,
+        err: BaseException | None,
+    ) -> None:
+        self._toxicity_analysis_busy = False
+        self._set_toxicity_analyze_loading(False)
+        if err is not None:
+            messagebox.showerror("Analyze Error", str(err))
+            self._log(f"Dataset Analyze Error: {err}")
+            return
+        assert result is not None
+
+        overall = int(result["overall"])
+        metrics = result["metrics"]
+        assert isinstance(metrics, dict)
+        clean_metrics = {str(k): int(v) for k, v in metrics.items()}
+        summary = str(result["summary"])
+        self._update_toxicity_ui(overall=overall, metrics=clean_metrics)
+        self._log_toxicity_summary(summary, overall)
+        if bool(result.get("cancelled")):
+            self._log(f"Dataset analysis cancelled: {int(result['row_count']):,} rows analyzed.")
+        else:
+            self._log(f"Dataset analysis completed: {int(result['row_count']):,} rows analyzed.")
+
+        self._store.insert_run(
+            user_id=self._user.id,
+            run_type="dataset",
+            source_filename=self._dataset_path.name if self._dataset_path else None,
+            row_count=int(result["row_count"]),
+            toxic_count=int(result["toxic_count"]),
+            non_toxic_count=int(result["non_toxic_count"]),
+            summary=f"{_format_history_scores_line(overall=overall, metrics=clean_metrics)}\n{summary}",
+        )
+        self._set_toxicity_download_ready(str(result["download_payload"]))
 
     def _complete_single_analyze_ui(
         self,
@@ -1206,6 +1613,10 @@ class ToxicCommentApp:
             metrics=metrics,
             analysis_summary=summary,
         )
+
+        snippet = text_raw.strip().replace("\n", " ")[:500]
+        scores_line = _format_history_scores_line(overall=overall, metrics=metrics)
+        self._set_toxicity_download_ready(f"{scores_line}\n{summary.strip()}\nText preview: {snippet}")
 
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
         overall = max(0, min(100, int(overall)))

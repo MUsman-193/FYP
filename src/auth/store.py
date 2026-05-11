@@ -95,6 +95,13 @@ class WorkbenchStore:
 
                 CREATE INDEX IF NOT EXISTS idx_runs_user ON analysis_runs(user_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_created ON analysis_runs(created_at);
+
+                CREATE TABLE IF NOT EXISTS app_session (
+                    key TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                );
                 """
             )
 
@@ -175,6 +182,40 @@ class WorkbenchStore:
             is_admin=bool(int(row["is_admin"])),
             is_blocked=bool(int(row["is_blocked"])),
         )
+
+    def get_user_by_id(self, user_id: int) -> UserRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, username, is_admin, is_blocked FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None or int(row["is_blocked"]):
+            return None
+        return UserRecord(
+            id=int(row["id"]),
+            username=str(row["username"]),
+            is_admin=bool(int(row["is_admin"])),
+            is_blocked=bool(int(row["is_blocked"])),
+        )
+
+    def save_session(self, user_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO app_session (key, user_id, updated_at) VALUES ('current', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET user_id = excluded.user_id, updated_at = excluded.updated_at",
+                (user_id, _utc_now_iso()),
+            )
+
+    def load_session(self) -> UserRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT user_id FROM app_session WHERE key = 'current'").fetchone()
+        if row is None:
+            return None
+        return self.get_user_by_id(int(row["user_id"]))
+
+    def clear_session(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM app_session WHERE key = 'current'")
 
     def list_users(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
