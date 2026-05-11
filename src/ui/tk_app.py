@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import gc
+import io
 import threading
 from tkinter import END, Tk, filedialog, messagebox
 from tkinter import ttk
@@ -25,8 +27,12 @@ from moderation import (
 )
 from preprocessing import PreprocessConfig, TextPreprocessor
 
-# Max rows rendered in Dataset Preview (full file still loaded; raise if UI tolerates it).
-PREVIEW_MAX_ROWS = 50_000
+# Rows shown in the analysis textarea; full TSV previews are very RAM-heavy in Tk.
+UI_PREVIEW_MAX_ROWS = 750
+# When suggesting preprocessing from stats, cap how many rows we scan at once.
+SUGGEST_SAMPLE_MAX_ROWS = 30_000
+# Single-message analyze: model cannot coherently classify an entire TSV preview.
+MAX_SINGLE_ANALYZE_CHARS = 12_000
 
 
 def _hsl_to_hex(h: float, s: float, l: float) -> str:
@@ -197,8 +203,15 @@ class _RoundedButton(tk.Canvas):
         hover_bg: str | None = None,
         active_bg: str | None = None,
         enabled: bool = True,
+        canvas_bg: str | None = None,
     ) -> None:
-        super().__init__(parent, bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2")
+        super().__init__(
+            parent,
+            bg=canvas_bg or parent.cget("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
         self._text = text
         self._command = command
         self._bg = bg
@@ -417,39 +430,59 @@ class ToxicCommentApp:
         self._tox_text = "#111827"
         self._tox_muted = "#6b7280"
         self._tox_bg = "#f9fafb"
+        self._tox_panel_bg = "#f3f4f6"
         self._tox_card_bg = "#ffffff"
 
-        container = ttk.Frame(self.root, padding=10)
+        self.root.configure(bg=self._tox_bg)
+        ttk_style = ttk.Style(self.root)
+        ttk_style.configure("TFrame", background=self._tox_bg)
+
+        container = tk.Frame(self.root, bg=self._tox_bg, padx=10, pady=10)
         container.pack(fill="both", expand=True)
 
-        nav = tk.Frame(container, bg=self._tox_bg)
+        nav = tk.Frame(container, bg=self._tox_panel_bg, highlightthickness=0, bd=0)
         nav.pack(fill="x", pady=(0, 6))
+
+        nav_btns = tk.Frame(nav, bg=self._tox_panel_bg, highlightthickness=0, bd=0)
+
+        def _header_btn(text: str, command: Callable[[], None]) -> _RoundedButton:
+            btn = _RoundedButton(
+                nav_btns,
+                text=text,
+                bg="#ffffff",
+                fg=self._tox_text,
+                command=command,
+                border=self._tox_border,
+                radius=12,
+                hover_bg="#f3f4f6",
+                active_bg="#e5e7eb",
+                canvas_bg=self._tox_panel_bg,
+            )
+            btn.autosize()
+            return btn
+
+        _header_btn("Analysis history", self._open_history_dialog).pack(side="left", padx=(0, 6))
+        if self._user.is_admin:
+            _header_btn("Manage users", self._open_admin_users_dialog).pack(side="left", padx=(0, 6))
+            _header_btn("System statistics", self._open_admin_stats_dialog).pack(side="left", padx=(0, 6))
+        _header_btn("Log out", self._logout).pack(side="left")
+        nav_btns.pack(side="right", padx=(20, 0))
+
+        user_strip = tk.Frame(nav, bg=self._tox_card_bg, highlightthickness=0, bd=0)
         tk.Label(
-            nav,
+            user_strip,
             text=f"Signed in as {self._user.username}"
             + (" (administrator)" if self._user.is_admin else ""),
             font=("Segoe UI", 10),
-            bg=self._tox_bg,
+            bg=self._tox_card_bg,
             fg=self._tox_muted,
-        ).pack(side="left")
-        nav_btns = tk.Frame(nav, bg=self._tox_bg)
-        nav_btns.pack(side="right")
-        ttk.Button(nav_btns, text="Analysis history", command=self._open_history_dialog).pack(
-            side="left", padx=(0, 6)
-        )
-        if self._user.is_admin:
-            ttk.Button(nav_btns, text="Manage users", command=self._open_admin_users_dialog).pack(
-                side="left", padx=(0, 6)
-            )
-            ttk.Button(nav_btns, text="System statistics", command=self._open_admin_stats_dialog).pack(
-                side="left", padx=(0, 6)
-            )
-        ttk.Button(nav_btns, text="Log out", command=self._logout).pack(side="left")
+        ).pack(anchor="w", padx=12, pady=8)
+        user_strip.pack(side="left", fill="both", expand=True)
 
-        middle = ttk.Frame(container)
+        middle = tk.Frame(container, bg=self._tox_bg)
         middle.pack(fill="both", expand=True, pady=10)
 
-        left_wrapper = ttk.Frame(middle)
+        left_wrapper = tk.Frame(middle, bg=self._tox_bg)
         left_wrapper.pack(side="left", fill="y")
         self.left_canvas = tk.Canvas(left_wrapper, width=380, highlightthickness=0, bg=self._tox_bg)
         left_scrollbar = ttk.Scrollbar(
@@ -468,7 +501,7 @@ class ToxicCommentApp:
         self.left_canvas.bind("<Enter>", self._bind_mousewheel)
         self.left_canvas.bind("<Leave>", self._unbind_mousewheel)
 
-        right = ttk.Frame(middle)
+        right = tk.Frame(middle, bg=self._tox_panel_bg)
         right.pack(side="left", fill="both", expand=True, padx=(12, 0))
 
         def _sidebar_card(parent: tk.Misc, title: str, *, height: int | None = None) -> tk.Frame:
@@ -671,7 +704,7 @@ class ToxicCommentApp:
                     break
 
         # Right side: unified interface (Preview + Logs + Toxicity Analysis)
-        merged = ttk.Frame(right, padding=0)
+        merged = tk.Frame(right, bg=self._tox_panel_bg, highlightthickness=0, bd=0)
         merged.pack(fill="both", expand=True)
         self._build_toxicity_tab(merged)
 
@@ -684,7 +717,7 @@ class ToxicCommentApp:
         self._tox_border = "#e5e7eb"
         self._tox_text = "#111827"
         self._tox_muted = "#6b7280"
-        self._tox_bg = "#f9fafb"
+        self._tox_bg = self._tox_panel_bg
         self._tox_card_bg = "#ffffff"
 
         header_bar = tk.Frame(parent, bg=self._tox_bg)
@@ -997,6 +1030,59 @@ class ToxicCommentApp:
                 up.set_enabled(True)
             self.root.update_idletasks()
 
+    def _text_for_single_toxicity_analyze(self, text_raw: str) -> tuple[str, str | None]:
+        """If the box holds a dataset preview (TSV), classify only the first row's text column.
+
+        Sending the entire preview makes small local models return collapsed, similar outputs.
+        """
+        s = text_raw.strip()
+        if not s.startswith("Dataset:") or "\n\n" not in s:
+            if len(s) > MAX_SINGLE_ANALYZE_CHARS:
+                return (
+                    s[:MAX_SINGLE_ANALYZE_CHARS],
+                    f"Input truncated to {MAX_SINGLE_ANALYZE_CHARS:,} characters for the model.",
+                )
+            return s, None
+        _, rest = s.split("\n\n", 1)
+        rest = rest.strip()
+        if not rest:
+            return s, None
+        try:
+            df = pd.read_csv(io.StringIO(rest), sep="\t", nrows=1)
+            text_col = self.text_col_var.get().strip()
+            cell = ""
+            if not df.empty and len(df.columns) > 0:
+                if text_col and text_col in df.columns:
+                    cell = str(df.loc[0, text_col])
+                else:
+                    cell = str(df.iloc[0, 0])
+            if not str(cell).strip():
+                lines = [ln for ln in rest.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    hdr = lines[0].split("\t")
+                    vals = lines[1].split("\t")
+                    if text_col and text_col in hdr:
+                        i = hdr.index(text_col)
+                        if i < len(vals):
+                            cell = vals[i]
+                    elif vals:
+                        cell = vals[0]
+            cell = str(cell).strip()
+            if not cell:
+                return s, None
+            note = (
+                "Dataset preview detected: analyzed only the first row's text column "
+                "(not the full table). Clear the box and paste one message to analyze something else."
+            )
+            if len(cell) > MAX_SINGLE_ANALYZE_CHARS:
+                return (
+                    cell[:MAX_SINGLE_ANALYZE_CHARS],
+                    note + f" Row text truncated to {MAX_SINGLE_ANALYZE_CHARS:,} characters.",
+                )
+            return cell, note
+        except Exception:
+            return s, None
+
     def _analyze_toxicity_text(self) -> None:
         if self._toxicity_analysis_busy:
             return
@@ -1006,6 +1092,8 @@ class ToxicCommentApp:
             messagebox.showerror("Analyze Error", "Please enter text (or upload a file) first.")
             return
 
+        analyzed_text, extract_note = self._text_for_single_toxicity_analyze(text_raw)
+
         if not getattr(self, "_tox_results_visible", False):
             self._tox_results_wrap.pack(fill="x", pady=(0, 6))
             self._tox_results_visible = True
@@ -1013,13 +1101,15 @@ class ToxicCommentApp:
         prep = self._build_prep_config()
         self._toxicity_analysis_busy = True
         self._set_toxicity_analyze_loading(True)
+        if extract_note:
+            self._log(extract_note)
 
         def worker() -> None:
             bundle: ToxicityTextMetricsBundle | None = None
             err: BaseException | None = None
             try:
                 bundle = preprocess_and_analyze_single(
-                    text_raw,
+                    analyzed_text,
                     preprocessor=self.preprocessor,
                     prep_config=prep,
                     toxicity_analyzer=self.toxicity_analyzer,
@@ -1029,7 +1119,7 @@ class ToxicCommentApp:
             br, er = bundle, err
             self.root.after(
                 0,
-                lambda tr=text_raw, bb=br, ee=er: self._complete_single_analyze_ui(tr, bb, ee),
+                lambda tr=analyzed_text, bb=br, ee=er: self._complete_single_analyze_ui(tr, bb, ee),
             )
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1138,7 +1228,7 @@ class ToxicCommentApp:
         self.file_var.set(path.name)
         try:
             if path.suffix.lower() == ".csv":
-                df = pd.read_csv(path)
+                df = pd.read_csv(path, low_memory=True)
             elif path.suffix.lower() in {".xlsx", ".xls"}:
                 df = pd.read_excel(path)
             elif path.suffix.lower() == ".json":
@@ -1150,7 +1240,7 @@ class ToxicCommentApp:
             messagebox.showerror("Load Error", str(exc))
             return
 
-        self.df = df.copy()
+        self.df = df
         cols = list(self.df.columns.astype(str))
         # Header column pickers were removed from the UI, so these comboboxes may not exist.
         # Keep dataset loading functional by only updating them when present.
@@ -1198,7 +1288,7 @@ class ToxicCommentApp:
             return
         self.tox_input.delete("1.0", END)
         # Use TSV-style preview to avoid padded right-aligned DataFrame formatting.
-        n_show = min(len(df), PREVIEW_MAX_ROWS)
+        n_show = min(len(df), UI_PREVIEW_MAX_ROWS)
         preview_df = df.head(n_show).fillna("").astype(str)
         preview_df = preview_df.apply(
             lambda col: col.str.replace("\n", "\\n", regex=False).str.replace("\t", " ", regex=False)
@@ -1224,9 +1314,33 @@ class ToxicCommentApp:
         if priority:
             preview_df = preview_df[priority + rest]
         preview_str = preview_df.to_csv(sep="\t", index=False)
-        header = f"Dataset loaded: {len(df):,} rows, {len(df.columns):,} columns\n\n"
+        truncated = len(df) > n_show
+        extra = (
+            f" (preview: first {n_show:,} rows only)"
+            if truncated
+            else ""
+        )
+        header = (
+            f"Dataset: {len(df):,} rows, {len(df.columns):,} columns{extra}\n\n"
+        )
         self.tox_input.insert("1.0", header + preview_str)
         self.tox_input.see("1.0")
+
+    def _processing_chunk_rows(self, text_sample: pd.Series) -> int:
+        """Adaptive batch size: smaller chunks when texts are long (limits peak RAM)."""
+        n = len(text_sample)
+        if n <= 0:
+            return 4096
+        sample_n = min(512, n)
+        lens = text_sample.iloc[:sample_n].astype(str).str.len()
+        mean_len = float(lens.mean()) if len(lens) else 0.0
+        if mean_len > 3000:
+            return 256
+        if mean_len > 1200:
+            return 512
+        if mean_len > 350:
+            return 2048
+        return min(8192, max(1024, n))
 
     def _detect_text_column(self, df: pd.DataFrame) -> str:
         object_cols = [c for c in df.columns if df[c].dtype == "object"]
@@ -1274,7 +1388,18 @@ class ToxicCommentApp:
 
     def _suggest_preprocessing(self) -> None:
         try:
-            texts = self._get_text_series().tolist()
+            series = self._get_text_series()
+            n_total = len(series)
+            if n_total > SUGGEST_SAMPLE_MAX_ROWS:
+                texts = (
+                    series.sample(n=SUGGEST_SAMPLE_MAX_ROWS, random_state=42).tolist()
+                )
+                self._log(
+                    f"Suggest preprocessing: sampled {SUGGEST_SAMPLE_MAX_ROWS:,} "
+                    f"of {n_total:,} rows (memory-efficient)."
+                )
+            else:
+                texts = series.tolist()
             cfg, stats = self.preprocessor.suggest(texts)
         except Exception as exc:
             messagebox.showerror("Suggestion Error", str(exc))
@@ -1320,7 +1445,16 @@ class ToxicCommentApp:
             return
 
         cfg = self._build_prep_config()
-        self.df["processed_text"] = text_series.apply(lambda t: self.preprocessor.apply(t, cfg))
+        n = len(self.df)
+        chunk = self._processing_chunk_rows(text_series)
+        out: list[str] = []
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            slab = text_series.iloc[start:end]
+            for t in slab:
+                out.append(self.preprocessor.apply(t, cfg))
+        self.df["processed_text"] = out
+        gc.collect()
         self._show_preview(self.df)
         self._log("Applied preprocessing. Output column: processed_text")
 
@@ -1353,9 +1487,16 @@ class ToxicCommentApp:
             return
         source_col = "processed_text" if "processed_text" in self.df.columns else self.text_col_var.get()
         cfg = self._build_aug_config()
-        self.df["augmented_text"] = self.df[source_col].astype(str).apply(
-            lambda t: self.augmenter.apply(t, cfg)
-        )
+        src = self.df[source_col].astype(str)
+        n = len(self.df)
+        chunk = self._processing_chunk_rows(src)
+        out: list[str] = []
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            for t in src.iloc[start:end]:
+                out.append(self.augmenter.apply(t, cfg))
+        self.df["augmented_text"] = out
+        gc.collect()
         self._show_preview(self.df)
         self._log(f"Applied augmentation on {source_col}. Output column: augmented_text")
 
@@ -1380,15 +1521,27 @@ class ToxicCommentApp:
             if text_col not in self.df.columns:
                 raise ValueError("Please select a valid text column.")
 
-            texts = self.df[text_col].astype(str).tolist()
-            results = self.profanity_scanner.scan_texts(texts)
+            text_series = self.df[text_col].astype(str)
+            n_rows = len(text_series)
+            chunk = self._processing_chunk_rows(text_series)
+            has_pf = [False] * n_rows
+            prof_counts = [0] * n_rows
+            prof_matches = [""] * n_rows
+            for start in range(0, n_rows, chunk):
+                end = min(start + chunk, n_rows)
+                for idx in range(start, end):
+                    r = self.profanity_scanner.scan_text(text_series.iloc[idx])
+                    has_pf[idx] = r.has_profanity
+                    prof_counts[idx] = r.profanity_count
+                    prof_matches[idx] = ", ".join(r.matches)
         except Exception as exc:
             messagebox.showerror("Scan Error", str(exc))
             return
 
-        self.df["has_profanity"] = [r.has_profanity for r in results]
-        self.df["profanity_count"] = [r.profanity_count for r in results]
-        self.df["profanity_matches"] = [", ".join(r.matches) for r in results]
+        self.df["has_profanity"] = has_pf
+        self.df["profanity_count"] = prof_counts
+        self.df["profanity_matches"] = prof_matches
+        gc.collect()
 
         flagged = int(sum(self.df["has_profanity"].astype(bool)))
         total = int(len(self.df))
@@ -1423,22 +1576,34 @@ class ToxicCommentApp:
                 "slut": "person",
             }
 
-            texts = self.df[source_col].astype(str).tolist()
-            results = self.profanity_sanitizer.sanitize_texts(
-                texts,
-                mode=mode,
-                mask_token=mask_token,
-                replacement_map=replacement_map,
-            )
+            text_series = self.df[source_col].astype(str)
+            n_rows = len(text_series)
+            chunk = self._processing_chunk_rows(text_series)
+            clean_texts: list[str] = []
+            clean_repls: list[str] = []
+            changed = 0
+            for start in range(0, n_rows, chunk):
+                end = min(start + chunk, n_rows)
+                for idx in range(start, end):
+                    r = self.profanity_sanitizer.sanitize(
+                        text_series.iloc[idx],
+                        mode=mode,
+                        mask_token=mask_token,
+                        replacement_map=replacement_map,
+                    )
+                    clean_texts.append(r.clean_text)
+                    clean_repls.append(", ".join(r.replacements))
+                    if r.replacements:
+                        changed += 1
         except Exception as exc:
             messagebox.showerror("Clean Error", str(exc))
             return
 
-        self.df["clean_text"] = [r.clean_text for r in results]
-        self.df["clean_replacements"] = [", ".join(r.replacements) for r in results]
+        self.df["clean_text"] = clean_texts
+        self.df["clean_replacements"] = clean_repls
+        gc.collect()
 
-        changed = int(sum(1 for r in results if r.replacements))
-        total = int(len(results))
+        total = n_rows
 
         self._show_preview(self.df)
         self._log(f"Cleaning completed on column: {source_col}")

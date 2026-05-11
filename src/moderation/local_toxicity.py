@@ -203,6 +203,7 @@ class LocalToxicityAnalyzer:
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
                     do_sample=False,
+                    repetition_penalty=1.12,
                     pad_token_id=(
                         self._tokenizer.pad_token_id
                         if self._tokenizer.pad_token_id is not None
@@ -218,13 +219,18 @@ class LocalToxicityAnalyzer:
             raise ToxicityModelError("Model returned empty output.")
 
         parsed = _parse_json_object(content)
+        if "toxicity_type" not in parsed and isinstance(parsed.get("toxicity_types"), list):
+            parsed["toxicity_type"] = parsed.get("toxicity_types")
         category = _normalize_list(parsed.get("category"), allowed=_DEFAULT_CATEGORIES, fallback=["None"])
         # Some generations echo almost every schema category; infer from toxicity_type instead.
         if len(category) >= 9:
             candidate = _infer_category_from_raw_types(parsed.get("toxicity_type"))
             category = _normalize_list([candidate], allowed=_DEFAULT_CATEGORIES, fallback=["None"])
         toxicity_level = _normalize_level(parsed.get("toxicity_level"), allowed=_DEFAULT_LEVELS, fallback="Low")
-        tox_types = _normalize_list(parsed.get("toxicity_type"), allowed=_DEFAULT_TYPES, fallback=[])
+        tox_types = _normalize_toxicity_types(parsed.get("toxicity_type"))
+        # Model sometimes lists most of the enum; treat as non-specific.
+        if len(tox_types) >= max(5, len(_DEFAULT_TYPES) - 2):
+            tox_types = []
         explanation = str(parsed.get("explanation") or "").strip()
 
         return ToxicityAnalysis(
@@ -270,30 +276,76 @@ def _infer_category_from_raw_types(types_val: Any) -> str:
 
 
 def _build_prompt(text: str) -> str:
-    cats = ", ".join(f'"{c}"' for c in _DEFAULT_CATEGORIES[:-1])
-    cats += ', or "None"'
-    types_ex = ", ".join(f'"{t}"' for t in _DEFAULT_TYPES)
-    levels = ", ".join(f'"{L}"' for L in _DEFAULT_LEVELS)
+    """Keep instructions compact so small LMs do not echo huge fake JSON schemas."""
+    cats = ", ".join(_DEFAULT_CATEGORIES)
+    types_ex = ", ".join(_DEFAULT_TYPES)
+    levels = ", ".join(_DEFAULT_LEVELS)
     return (
-        "Analyze the following text for harmful or toxic content.\n\n"
-        "Tasks:\n"
-        "1. Detect toxic or offensive language.\n"
-        "2. Assign categories (use exact strings).\n"
-        "3. Set toxicity_level (use exact strings).\n"
-        "4. Set toxicity_type (use exact strings; may be empty). \n"
-        "5. Write a concise explanation.\n\n"
-        "VALID JSON OUTPUT ONLY — no Markdown, no code fences.\n"
-        "Use commas between array elements. NEVER use '|' characters in arrays.\n"
-        "\n"
-        'Example (shape only): {"category":["None"],"toxicity_level":"Low",'
-        '"toxicity_type":[],"explanation":"..."}\n\n'
-        "Allowed category values exactly one of:\n"
+        "You classify a single user message for moderation.\n\n"
+        "Respond with ONE JSON object and ONLY these four keys (no other keys, no preamble):\n"
+        '"category" (array of 1-3 strings), "toxicity_level" (one string), '
+        '"toxicity_type" (array, often empty), "explanation" (one short string).\n\n'
+        "Rules:\n"
+        "- Do NOT output tasks, instructions, allowed lists, or schema inside JSON.\n"
+        '- Arrays must stay short (category ≤3 items, toxicity_type ≤4 items).\n'
+        "- Use comma-separated JSON arrays only; never use '|' inside arrays.\n"
+        "- If text is fine, use category [\"None\"], level \"Low\", toxicity_type [].\n\n"
+        "Allowed category strings (pick the best fit): "
         f"{cats}.\n"
-        f"Toxicity level must be one of: {levels}.\n"
-        f"Toxicity type values (zero or more) from: {types_ex}.\n\n"
-        "Text:\n"
+        f"Allowed levels: {levels}.\n"
+        f"Optional toxicity_type strings (omit unknowns): {types_ex}.\n\n"
+        "Example shape:\n"
+        '{"category":["None"],"toxicity_level":"Low","toxicity_type":[],"explanation":"No harm detected."}\n\n'
+        "Message to classify:\n"
         f"{text}"
     )
+
+
+def _brace_balanced_object(s: str, open_brace: int) -> str | None:
+    """Return substring s[open_brace : end+1] for a balanced {...} or None if truncated."""
+    if open_brace < 0 or open_brace >= len(s) or s[open_brace] != "{":
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(open_brace, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[open_brace : i + 1]
+    return None
+
+
+def _classification_json_candidates(raw: str) -> list[str]:
+    """Pull balanced JSON objects whose first key is category (ignores leading schema junk)."""
+    out: list[str] = []
+    for m in re.finditer(r"\{\s*\"category\"\s*:", raw):
+        blob = _brace_balanced_object(raw, m.start())
+        if blob:
+            out.append(blob)
+    return out
+
+
+def _looks_like_schema_echo(raw: str) -> bool:
+    rl = raw.lower()
+    if "allowed_categories" in rl:
+        return True
+    if re.search(r'"tasks"\s*:\s*\[', raw) and len(raw) > 500:
+        return True
+    return False
 
 
 def _repair_schema_union_in_arrays(blob: str) -> str:
@@ -340,6 +392,10 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     m_obj = re.search(r"\{[\s\S]*\}", t)
     if m_obj:
         blobs.append(m_obj.group(0))
+    # Prefer small trailing objects after the model echoed a large fake schema.
+    for sub in _classification_json_candidates(t):
+        if sub not in blobs:
+            blobs.insert(0, sub)
 
     tries: list[str] = []
     for b in blobs:
@@ -361,9 +417,20 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             last_err = exc
             continue
 
+    for sub in reversed(_classification_json_candidates(t)):
+        loose = _fallback_parse_classification_dict(sub)
+        if loose.get("toxicity_level") or loose.get("category") or loose.get("explanation"):
+            return loose
+
     loose = _fallback_parse_classification_dict(m_obj.group(0) if m_obj else t)
     if loose.get("toxicity_level") or loose.get("category") or loose.get("explanation"):
         return loose
+
+    if _looks_like_schema_echo(t):
+        raise ToxicityModelError(
+            "The model repeated a long instruction-style JSON instead of a short classification. "
+            "Try a shorter message, or retry; the prompt has been tightened to reduce this."
+        )
 
     detail = (
         f"Failed to parse model JSON. Raw output truncated:\n{text[:1600]}..."
@@ -373,6 +440,46 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if last_err is not None:
         raise ToxicityModelError(detail) from last_err
     raise ToxicityModelError(detail)
+
+
+def _coerce_toxicity_type_token(raw: str) -> str | None:
+    """Map common model misspellings / plurals onto ``_DEFAULT_TYPES``."""
+    key = str(raw or "").strip().lower()
+    if not key:
+        return None
+    allowed_norm = {a.lower(): a for a in _DEFAULT_TYPES}
+    if key in allowed_norm:
+        return allowed_norm[key]
+    if "threat" in key:
+        return "Threat"
+    if "identity" in key and "attack" in key:
+        return "Identity Attack"
+    if key in {"identity-based attack", "identity based attack", "id attack"}:
+        return "Identity Attack"
+    return None
+
+
+def _normalize_toxicity_types(value: Any) -> list[str]:
+    """Like ``_normalize_list`` but accepts near-miss type strings the model often emits."""
+    if value is None:
+        return []
+    items: list[str] = []
+    if isinstance(value, list):
+        items = [str(x).strip() for x in value if str(x).strip()]
+    elif isinstance(value, str):
+        items = [p.strip() for p in value.split(",") if p.strip()]
+    else:
+        s = str(value).strip()
+        if s:
+            items = [s]
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in items:
+        canon = _coerce_toxicity_type_token(it)
+        if canon and canon not in seen:
+            out.append(canon)
+            seen.add(canon)
+    return out
 
 
 def _normalize_level(value: Any, *, allowed: Iterable[str], fallback: str) -> str:
