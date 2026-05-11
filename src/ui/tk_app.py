@@ -693,6 +693,75 @@ class ToxicCommentApp:
 
         if self._user.is_admin:
             model_frame = _sidebar_card(left, "Model Investigation")
+            tk.Label(
+                model_frame,
+                text="Training dataset — load CSV/Excel/JSON with text + labels",
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_muted,
+                wraplength=320,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 8))
+            load_train_btn = _RoundedButton(
+                model_frame,
+                text="Load training dataset",
+                bg="#ffffff",
+                fg=self._tox_text,
+                command=self._admin_load_training_dataset,
+                border=self._tox_border,
+                radius=12,
+                hover_bg="#f3f4f6",
+                active_bg="#e5e7eb",
+            )
+            load_train_btn.configure(height=34)
+            load_train_btn.pack(fill="x", pady=(0, 8))
+            tk.Label(
+                model_frame,
+                text="File:",
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_muted,
+            ).pack(anchor="w")
+            tk.Label(
+                model_frame,
+                textvariable=self.file_var,
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_text,
+                wraplength=320,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 10))
+            tk.Label(
+                model_frame,
+                text="Text column",
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_muted,
+            ).pack(anchor="w")
+            self.text_col_combo = ttk.Combobox(
+                model_frame,
+                textvariable=self.text_col_var,
+                state="readonly",
+                values=[],
+                width=30,
+            )
+            self.text_col_combo.pack(fill="x", pady=(4, 8))
+            tk.Label(
+                model_frame,
+                text="Label column",
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_muted,
+            ).pack(anchor="w")
+            self.label_col_combo = ttk.Combobox(
+                model_frame,
+                textvariable=self.label_col_var,
+                state="readonly",
+                values=[],
+                width=30,
+            )
+            self.label_col_combo.pack(fill="x", pady=(4, 12))
+            _divider(model_frame)
             investigate_btn = _RoundedButton(
                 model_frame,
                 text="Investigate Architectures",
@@ -1103,6 +1172,7 @@ class ToxicCommentApp:
         self._show_preview(self.df)
         self._log(f"Loaded text dataset with {len(rows):,} rows from file: {path.name}")
         self._log("Text analysis mode: one line is treated as one row/comment.")
+        self._refresh_admin_training_columns()
         self._scan_profanity()
 
     def _set_toxicity_download_ready(self, payload: str | None) -> None:
@@ -1655,6 +1725,45 @@ class ToxicCommentApp:
             self._dataset_path = p
             self.file_var.set(p.name)
 
+    def _admin_load_training_dataset(self) -> None:
+        """Admin: load CSV/Excel/JSON with text + labels for classical model training."""
+        if not self._user.is_admin:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load training dataset",
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("Excel files", "*.xlsx *.xls"),
+                ("JSON files", "*.json"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._load_dataset_path(Path(path))
+
+    def _refresh_admin_training_columns(self) -> None:
+        if not hasattr(self, "text_col_combo"):
+            return
+        if self.df is None:
+            self.text_col_combo.configure(values=())
+            self.label_col_combo.configure(values=())
+            return
+        cols = tuple(self.df.columns.astype(str))
+        self.text_col_combo.configure(values=cols)
+        self.label_col_combo.configure(values=cols)
+        tc = self.text_col_var.get().strip()
+        if cols and tc not in cols:
+            self.text_col_var.set(cols[0])
+            tc = cols[0]
+        lc = self.label_col_var.get().strip()
+        if cols and lc and lc not in cols:
+            self.label_col_var.set("")
+        if cols and not self.label_col_var.get().strip():
+            det = self._detect_label_column(self.df, tc)
+            if det in cols:
+                self.label_col_var.set(det)
+
     def _load_dataset_path(self, path: Path) -> None:
         if not path.exists():
             messagebox.showerror("Error", "Please select a valid dataset file.")
@@ -1676,20 +1785,14 @@ class ToxicCommentApp:
             return
 
         self.df = df
-        cols = list(self.df.columns.astype(str))
-        # Header column pickers were removed from the UI, so these comboboxes may not exist.
-        # Keep dataset loading functional by only updating them when present.
-        if hasattr(self, "text_col_combo"):
-            self.text_col_combo["values"] = cols  # type: ignore[attr-defined]
-        if hasattr(self, "label_col_combo"):
-            self.label_col_combo["values"] = cols  # type: ignore[attr-defined]
-
         text_col = self._detect_text_column(self.df)
         label_col = self._detect_label_column(self.df, text_col)
         if text_col:
             self.text_col_var.set(text_col)
         if label_col:
             self.label_col_var.set(label_col)
+
+        self._refresh_admin_training_columns()
 
         self._show_preview(self.df)
         self._log(f"Loaded dataset with shape: {self.df.shape}")
@@ -1820,6 +1923,38 @@ class ToxicCommentApp:
         if col not in self.df.columns:
             raise ValueError("Please select a valid label column.")
         return self.df[col].astype(str)
+
+    def _validate_training_pair(self, texts: list[str], labels: list[str]) -> tuple[bool, str]:
+        if len(texts) != len(labels):
+            return False, "Text and label lists have different lengths."
+        text_col = self.text_col_var.get().strip()
+        label_col = self.label_col_var.get().strip()
+        if text_col == label_col:
+            return (
+                False,
+                "Text column and label column must be different. "
+                "Choose the categorical label column (for example toxic: 0/1), not the comment body.",
+            )
+        n = len(labels)
+        if n == 0:
+            return False, "No rows to train on."
+        uniq = len({str(y) for y in labels})
+        if n >= 20 and uniq / n >= 0.85:
+            return (
+                False,
+                f"The label column has {uniq:,} unique values across {n:,} rows. "
+                "That usually means the comment text was selected as labels. "
+                "Pick the label column (for example toxic), not the text column.",
+            )
+        sample = [str(y) for y in labels[: min(200, n)]]
+        mean_len = sum(len(s) for s in sample) / max(len(sample), 1)
+        if uniq > 50 and mean_len > 80:
+            return (
+                False,
+                "Label values look like long text, not class names or numbers. "
+                "Check that the label column is categorical (for example 0/1 or toxic/nontoxic).",
+            )
+        return True, ""
 
     def _suggest_preprocessing(self) -> None:
         try:
@@ -2051,10 +2186,20 @@ class ToxicCommentApp:
         if self.df is None:
             messagebox.showerror("Model Error", "Dataset not loaded.")
             return
+        if not self.label_col_var.get().strip():
+            messagebox.showerror(
+                "Investigation Error",
+                "Choose a label column. Load a training CSV with labels (see Model Investigation).",
+            )
+            return
         try:
             text_col = self._training_text_column()
             texts = self.df[text_col].astype(str).tolist()
             labels = self._get_label_series().tolist()
+            ok, err = self._validate_training_pair(texts, labels)
+            if not ok:
+                messagebox.showerror("Investigation Error", err)
+                return
             result = self.model_manager.investigate(texts, labels)
         except Exception as exc:
             messagebox.showerror("Investigation Error", str(exc))
@@ -2078,10 +2223,21 @@ class ToxicCommentApp:
         if not model_name:
             messagebox.showerror("Train Error", "Please choose an architecture.")
             return
+        if not self.label_col_var.get().strip():
+            messagebox.showerror(
+                "Train Error",
+                "Choose a label column. Training requires a CSV (or Excel/JSON) with a label column "
+                "(e.g. toxic). Plain .txt uploads have comments only.",
+            )
+            return
         try:
             text_col = self._training_text_column()
             texts = self.df[text_col].astype(str).tolist()
             labels = self._get_label_series().tolist()
+            ok, err = self._validate_training_pair(texts, labels)
+            if not ok:
+                messagebox.showerror("Train Error", err)
+                return
             metrics, report = self.model_manager.train_selected(texts, labels, model_name)
         except Exception as exc:
             messagebox.showerror("Train Error", str(exc))

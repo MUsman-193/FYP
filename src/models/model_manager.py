@@ -26,6 +26,19 @@ class InvestigationResult:
     best_f1_macro: float
 
 
+def _safe_stratify_arg(labels: List[str]):
+    """Stratified split requires every class to appear at least twice; otherwise return None."""
+    from collections import Counter
+
+    ys = [str(y) for y in labels]
+    cnt = Counter(ys)
+    if len(cnt) < 2:
+        return None
+    if min(cnt.values()) < 2:
+        return None
+    return ys
+
+
 class ModelManager:
     """Investigates classical architectures and trains selected models."""
 
@@ -69,7 +82,7 @@ class ModelManager:
             labels,
             test_size=test_size,
             random_state=self.random_state,
-            stratify=labels,
+            stratify=_safe_stratify_arg(labels),
         )
 
         rows = []
@@ -113,7 +126,7 @@ class ModelManager:
             labels,
             test_size=test_size,
             random_state=self.random_state,
-            stratify=labels,
+            stratify=_safe_stratify_arg(labels),
         )
 
         pipeline = self._make_pipeline(model_name)
