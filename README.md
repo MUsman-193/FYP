@@ -13,6 +13,8 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
+> **Admin login (created on first start):** **Username:** `admin` · **Password:** `Bc220411312@`
+
 ## Test dataset
 Use this sample dataset to try loading, preprocessing, augmentation, model investigation, and toxicity analysis in the workbench.
 
