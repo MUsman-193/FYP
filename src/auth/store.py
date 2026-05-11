@@ -235,6 +235,11 @@ class WorkbenchStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def clear_runs_for_user(self, user_id: int) -> int:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM analysis_runs WHERE user_id = ?", (user_id,))
+            return int(cur.rowcount)
+
     def get_run(self, run_id: int, user_id: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(

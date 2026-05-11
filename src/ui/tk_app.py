@@ -33,6 +33,39 @@ UI_PREVIEW_MAX_ROWS = 750
 SUGGEST_SAMPLE_MAX_ROWS = 30_000
 # Single-message analyze: model cannot coherently classify an entire TSV preview.
 MAX_SINGLE_ANALYZE_CHARS = 12_000
+_HISTORY_METRIC_ORDER = (
+    "Toxicity",
+    "Severe Toxicity",
+    "Identity Attack",
+    "Insult",
+    "Profanity",
+    "Threat",
+)
+
+
+def _format_history_scores_line(*, overall: int, metrics: dict[str, int]) -> str:
+    parts = [f"Overall: {int(overall)}%"]
+    for name in _HISTORY_METRIC_ORDER:
+        parts.append(f"{name}: {int(metrics[name])}%")
+    return " | ".join(parts)
+
+
+def _history_summary_column(summary: str) -> str:
+    first = (summary or "").splitlines()[0].strip() if summary else ""
+    if first.startswith("Overall:"):
+        return first
+    return first.replace("\n", " ")[:400]
+
+
+def _history_analysis_preview(summary: str) -> str:
+    text = (summary or "").strip()
+    if not text:
+        return "(No analysis result saved for this run.)"
+    lines = text.splitlines()
+    if lines and (lines[0].startswith("Overall:") or lines[0].startswith("Single:")):
+        body = "\n".join(lines[1:]).strip()
+        return body or text
+    return text
 
 
 def _hsl_to_hex(h: float, s: float, l: float) -> str:
@@ -1171,12 +1204,7 @@ class ToxicCommentApp:
             text_raw=text_raw,
             overall=overall,
             metrics=metrics,
-            summary_line=(
-                "Single: "
-                f"top={max(metrics.items(), key=lambda kv: int(kv[1]))[0]} "
-                f"({max((int(v) for v in metrics.values()), default=0)}%) "
-                f"level={lvl}"
-            ),
+            analysis_summary=summary,
         )
 
     def _update_toxicity_ui(self, overall: int, metrics: dict[str, int]) -> None:
@@ -1662,11 +1690,12 @@ class ToxicCommentApp:
         text_raw: str,
         overall: int,
         metrics: dict[str, int],
-        summary_line: str,
+        analysis_summary: str,
     ) -> None:
         toxic = 1 if (max((int(v) for v in metrics.values()), default=0) >= 20) else 0
         snippet = text_raw.strip().replace("\n", " ")[:500]
-        summary = f"{summary_line}\nText preview: {snippet}"
+        scores_line = _format_history_scores_line(overall=overall, metrics=metrics)
+        summary = f"{scores_line}\n{analysis_summary.strip()}\nText preview: {snippet}"
         self._store.insert_run(
             user_id=self._user.id,
             run_type="single",
@@ -1680,7 +1709,7 @@ class ToxicCommentApp:
     def _open_history_dialog(self) -> None:
         win = tk.Toplevel(self.root)
         win.title("Analysis history")
-        win.geometry("900x420")
+        win.geometry("1040x460")
         win.transient(self.root)
 
         cols = ("created", "type", "rows", "toxic", "nontoxic", "summary")
@@ -1691,12 +1720,12 @@ class ToxicCommentApp:
         tree.heading("toxic", text="Toxic")
         tree.heading("nontoxic", text="Non-toxic")
         tree.heading("summary", text="Summary")
-        tree.column("created", width=160)
+        tree.column("created", width=150)
         tree.column("type", width=70)
-        tree.column("rows", width=60)
-        tree.column("toxic", width=60)
+        tree.column("rows", width=55)
+        tree.column("toxic", width=55)
         tree.column("nontoxic", width=70)
-        tree.column("summary", width=420)
+        tree.column("summary", width=620)
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
         def refresh() -> None:
@@ -1713,28 +1742,60 @@ class ToxicCommentApp:
                         r.get("row_count"),
                         r.get("toxic_count"),
                         r.get("non_toxic_count"),
-                        (r.get("summary") or "").replace("\n", " ")[:200],
+                        _history_summary_column(r.get("summary") or ""),
                     ),
                 )
 
         refresh()
 
-        def on_details(_event: tk.Event | None = None) -> None:
-            sel = tree.selection()
-            if not sel:
-                return
-            rid = int(sel[0])
-            row = self._store.get_run(rid, self._user.id)
+        def show_analysis_preview(run_id: int) -> None:
+            row = self._store.get_run(run_id, self._user.id)
             if not row:
                 return
+            preview = _history_analysis_preview(row.get("summary") or "")
             rp = row.get("results_path")
-            detail = (row.get("summary") or "").strip()
             if rp and Path(rp).is_file():
-                detail += f"\n\nSaved results file:\n{rp}"
-            messagebox.showinfo("Run details", detail or "(No summary)")
+                preview = f"{preview}\n\nSaved results file:\n{rp}"
 
-        tree.bind("<Double-1>", on_details)
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+            detail_win = tk.Toplevel(win)
+            detail_win.title("Analysis result preview")
+            detail_win.geometry("760x520")
+            detail_win.transient(win)
+
+            text = tk.Text(detail_win, wrap="word", font=("Segoe UI", 10), padx=12, pady=12)
+            text.pack(fill="both", expand=True)
+            text.insert("1.0", preview)
+            text.configure(state="disabled")
+
+            ttk.Button(detail_win, text="Close", command=detail_win.destroy).pack(pady=(0, 10))
+
+        def on_summary_click(event: tk.Event) -> None:
+            if tree.identify_region(event.x, event.y) != "cell":
+                return
+            if tree.identify_column(event.x) != "#6":
+                return
+            row_id = tree.identify_row(event.y)
+            if not row_id:
+                return
+            show_analysis_preview(int(row_id))
+
+        tree.bind("<ButtonRelease-1>", on_summary_click)
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+
+        def clear_history() -> None:
+            if not messagebox.askyesno(
+                "Clear history",
+                "Delete all analysis history for your account? This cannot be undone.",
+            ):
+                return
+            removed = self._store.clear_runs_for_user(self._user.id)
+            refresh()
+            messagebox.showinfo("Clear history", f"Removed {removed} entr{'y' if removed == 1 else 'ies'}.")
+
+        ttk.Button(btn_row, text="Clear history", command=clear_history).pack(side="left")
+        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side="right")
 
     def _open_admin_users_dialog(self) -> None:
         if not self._user.is_admin:
