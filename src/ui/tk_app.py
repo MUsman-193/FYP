@@ -691,59 +691,55 @@ class ToxicCommentApp:
         apply_aug_btn.configure(height=34)
         apply_aug_btn.pack(fill="x", pady=(10, 0))
 
-        model_frame = _sidebar_card(left, "Model Investigation")
-        investigate_btn = _RoundedButton(
-            model_frame,
-            text="Investigate Architectures",
-            bg="#ffffff",
-            fg=self._tox_text,
-            command=self._investigate_architectures,
-            border=self._tox_border,
-            radius=12,
-            hover_bg="#f3f4f6",
-            active_bg="#e5e7eb",
-        )
-        investigate_btn.configure(height=34)
-        investigate_btn.pack(fill="x", pady=(0, 10))
-        tk.Label(
-            model_frame,
-            text="Selected Architecture",
-            font=("Segoe UI", 9),
-            bg=self._tox_card_bg,
-            fg=self._tox_muted,
-        ).pack(anchor="w")
-        self.model_combo = ttk.Combobox(
-            model_frame,
-            textvariable=self.model_var,
-            state="readonly",
-            values=list(self.model_manager.model_factories.keys())
-            if (self._modeling_available and self.model_manager is not None)
-            else [],
-            width=30,
-        )
-        self.model_combo.pack(fill="x", pady=(6, 10))
-        self.train_button = _RoundedButton(
-            model_frame,
-            text="Train Selected Model",
-            bg=self._tox_blue,
-            fg="#ffffff",
-            command=self._train_selected,
-            border=self._tox_blue,
-            radius=12,
-            hover_bg=self._tox_blue,
-            active_bg=self._tox_blue,
-        )
-        self.train_button.configure(height=34)
-        self.train_button.pack(fill="x")
-        if not self._modeling_available:
-            self.model_combo.configure(state="disabled")
-            self.train_button.set_enabled(False)
-
-            # Disable the investigate button too.
-            for child in model_frame.winfo_children():
-                if isinstance(child, _RoundedButton) and getattr(child, "_text", "") == "Investigate Architectures":
-                    child.set_enabled(False)
-                    break
+        if self._user.is_admin:
+            model_frame = _sidebar_card(left, "Model Investigation")
+            investigate_btn = _RoundedButton(
+                model_frame,
+                text="Investigate Architectures",
+                bg="#ffffff",
+                fg=self._tox_text,
+                command=self._investigate_architectures,
+                border=self._tox_border,
+                radius=12,
+                hover_bg="#f3f4f6",
+                active_bg="#e5e7eb",
+            )
+            investigate_btn.configure(height=34)
+            investigate_btn.pack(fill="x", pady=(0, 10))
+            tk.Label(
+                model_frame,
+                text="Selected Architecture",
+                font=("Segoe UI", 9),
+                bg=self._tox_card_bg,
+                fg=self._tox_muted,
+            ).pack(anchor="w")
+            self.model_combo = ttk.Combobox(
+                model_frame,
+                textvariable=self.model_var,
+                state="readonly",
+                values=list(self.model_manager.model_factories.keys())
+                if (self._modeling_available and self.model_manager is not None)
+                else [],
+                width=30,
+            )
+            self.model_combo.pack(fill="x", pady=(6, 10))
+            self.train_button = _RoundedButton(
+                model_frame,
+                text="Train Selected Model",
+                bg=self._tox_blue,
+                fg="#ffffff",
+                command=self._train_selected,
+                border=self._tox_blue,
+                radius=12,
+                hover_bg=self._tox_blue,
+                active_bg=self._tox_blue,
+            )
+            self.train_button.configure(height=34)
+            self.train_button.pack(fill="x")
+            if not self._modeling_available:
+                self.model_combo.configure(state="disabled")
+                self.train_button.set_enabled(False)
+                investigate_btn.set_enabled(False)
 
         # Right side: unified interface (Preview + Logs + Toxicity Analysis)
         merged = tk.Frame(right, bg=self._tox_panel_bg, highlightthickness=0, bd=0)
@@ -2050,6 +2046,8 @@ class ToxicCommentApp:
         self._log(f"Rows changed: {changed:,} / {total:,}")
 
     def _investigate_architectures(self) -> None:
+        if not self._user.is_admin:
+            return
         if self.df is None:
             messagebox.showerror("Model Error", "Dataset not loaded.")
             return
@@ -2071,6 +2069,8 @@ class ToxicCommentApp:
         )
 
     def _train_selected(self) -> None:
+        if not self._user.is_admin:
+            return
         if self.df is None:
             messagebox.showerror("Train Error", "Dataset not loaded.")
             return
