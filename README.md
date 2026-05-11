@@ -14,12 +14,25 @@ python src/main.py
 ```
 
 ## Toxicity analysis (FYP model)
-The workbench runs structured toxicity analysis with a **custom FYP model** whose weights live at `modal/FYP-model.safetensors`. Inference is **fully local** in Python using **PyTorch** and **transformers** (no separate LLM server).
+The workbench runs structured toxicity analysis with a **custom FYP model** whose weights and tokenizer assets live under the project **`model/`** folder. Inference is **fully local** in Python using **PyTorch** and **transformers** (no separate LLM server).
 
-**After cloning:** the repo includes an empty **`modal/`** folder at the project root (large weight files are not committed to Git). **Download the model file**, then **place it inside `modal/`** with the exact name **`FYP-model.safetensors`**.
+> **Note:** Download the **whole model folder** from Google Drive and **paste it into the project main folder** (repository root) as **`model/`**. Do not download files one by one, and do not put the files inside an extra nested folder.
 
-- **Download weights:** [Download `FYP-model.safetensors`](https://drive.google.com/file/d/1ekUQH5iaY2Haxai7dn53i0Z44E_NEpie/view?usp=drive_link) → save into `modal/` as shown above.
-- **Runtime**: tokenizer and model settings are loaded from the ``modal/`` folder when you place ``config.json`` and tokenizer files there next to ``FYP-model.safetensors`` (fully offline). Otherwise set environment variable ``FYP_METADATA_SOURCE`` to a directory that contains those files, or rely on a one-time download/cache on first run if neither is set.
+
+```text
+FYP/
+└── model/
+    ├── model.safetensors
+    ├── config.json
+    ├── tokenizer.json
+    ├── tokenizer_config.json
+    ├── vocab.json
+    ├── merges.txt
+    ├── generation_config.json
+```
+
+- **Download model folder:** [Download model assets](https://drive.google.com/drive/folders/1PVjcNqi3zoqL5kvwlntsKE34bn2Rt0dH?usp=drive_link) — includes `model.safetensors`, `config.json`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`and `generation_config.json` .
+- **Runtime:** tokenizer and model settings are read from **`model/`** next to the weights file (fully offline). To use a different directory, set environment variable `FYP_METADATA_SOURCE` to a folder that contains those files, or set `FYP_WEIGHTS_PATH` to a specific `.safetensors` file.
 
 Install the extra packages with `pip install -r requirements.txt` (`torch`, `transformers`, `safetensors`, `accelerate`). A GPU is recommended; CPU is supported but slower.
 
