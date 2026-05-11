@@ -13,6 +13,13 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
+## Test dataset
+Use this sample dataset to try loading, preprocessing, augmentation, model investigation, and toxicity analysis in the workbench.
+
+- **Download test dataset:** [Download dataset for testing](https://drive.google.com/drive/folders/1Ru4cpb3hqdDkxFl-dv-3xAc1pLcdUZ7K?usp=drive_link)
+- **Supported formats:** CSV, XLSX, and JSON (as described under Implemented Functional Requirements).
+- **Usage:** load the file in the app, choose the text and label columns, then run investigation, training, or analysis as needed.
+
 ## Toxicity analysis (FYP model)
 The workbench runs structured toxicity analysis with a **custom FYP model** whose weights and tokenizer assets live under the project **`model/`** folder. Inference is **fully local** in Python using **PyTorch** and **transformers** (no separate LLM server).
 
