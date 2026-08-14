@@ -921,10 +921,36 @@ class ToxicCommentApp:
             padx=10,
             pady=10,
         )
-        tox_input_v = ttk.Scrollbar(tox_input_wrap, orient="vertical", command=self.tox_input.yview)
+        tox_input_v = ttk.Scrollbar(tox_input_wrap, orient="vertical", command=self._preview_scroll_command)
         self.tox_input.configure(yscrollcommand=tox_input_v.set)
         self.tox_input.grid(row=0, column=0, sticky="nsew")
         tox_input_v.grid(row=0, column=1, sticky="ns")
+        self.tox_input.bind("<MouseWheel>", self._preview_mousewheel, add="+")
+        self._dataset_progress_var = tk.StringVar(value="Ready")
+        tk.Label(
+            input_card_inner,
+            textvariable=self._dataset_progress_var,
+            anchor="w",
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+            font=("Segoe UI", 9),
+        ).pack(fill="x", pady=(6, 0))
+
+        # Dataset controls keep large jobs bounded while still allowing full runs.
+        dataset_opts = tk.Frame(input_card_inner, bg=self._tox_card_bg)
+        dataset_opts.pack(fill="x", pady=(10, 0))
+        tk.Label(dataset_opts, text="Dataset mode", bg=self._tox_card_bg, fg=self._tox_muted).pack(side="left")
+        self._dataset_mode_var = tk.StringVar(value="Full dataset")
+        ttk.Combobox(
+            dataset_opts,
+            textvariable=self._dataset_mode_var,
+            values=("Full dataset", "First N rows", "Random sample"),
+            state="readonly",
+            width=16,
+        ).pack(side="left", padx=(8, 14))
+        tk.Label(dataset_opts, text="Rows", bg=self._tox_card_bg, fg=self._tox_muted).pack(side="left")
+        self._dataset_limit_var = tk.StringVar(value="1000")
+        ttk.Entry(dataset_opts, textvariable=self._dataset_limit_var, width=8).pack(side="left", padx=(8, 0))
 
         actions = tk.Frame(input_card_inner, bg=self._tox_card_bg)
         actions.pack(fill="x", pady=(12, 0))
@@ -1205,11 +1231,15 @@ class ToxicCommentApp:
         if not self._toxicity_analysis_busy:
             return
         self._toxicity_cancel_event.set()
+        # Release the UI immediately. The worker will observe the event between
+        # batches; any late result is discarded by the completion handlers.
+        self._toxicity_analysis_busy = False
+        self._set_toxicity_analyze_loading(False)
         btn = getattr(self, "cancel_analysis_btn", None)
         if btn is not None:
             btn.set_text("Cancelling...")
             btn.set_enabled(False)
-        self._log("Cancel requested. Analysis will stop after the current row finishes.")
+        self._log("Analysis cancelled. Cleaning up the active worker in the background.")
 
     def _set_toxicity_analyze_ready(self) -> None:
         btn = getattr(self, "analyze_btn", None)
@@ -1394,11 +1424,7 @@ class ToxicCommentApp:
                     seconds=elapsed,
                     rps=rate,
                     bi=batch_index,
-                    bs=batch_size: self._log(
-                        f"Dataset analysis {percent:.2f}% complete "
-                        f"({done:,}/{total:,} rows checked, batch {bi:,} size {bs:,}, starting row {row:,}, "
-                        f"{ok:,} analyzed, {fail:,} errors, {seconds/60:.1f} min, {rps:.2f} rows/sec)"
-                    ),
+                    bs=batch_size: self._report_dataset_progress(percent, done, total, ok, fail, seconds / 60, rps),
                 )
             try:
                 for row_number, analysis in self.toxicity_analyzer.analyze_batch(batch):
@@ -1437,11 +1463,7 @@ class ToxicCommentApp:
                     ok=analyzed,
                     fail=len(errors),
                     seconds=elapsed,
-                    rps=rate: self._log(
-                        f"Dataset analysis progress: {percent:.2f}% complete "
-                        f"({done:,}/{total:,} rows checked, {ok:,} analyzed, {fail:,} errors, "
-                        f"{seconds/60:.1f} min, {rps:.2f} rows/sec)"
-                    ),
+                    rps=rate: self._report_dataset_progress(percent, done, total, ok, fail, seconds / 60, rps),
                 )
 
         if analyzed <= 0:
@@ -1515,6 +1537,7 @@ class ToxicCommentApp:
             fill.configure(width=0)
 
     def _analyze_toxicity_text(self) -> None:
+        self._sync_preview_to_df()
         if self._toxicity_analysis_busy:
             return
         if not self._toxicity_model_ready:
@@ -1548,6 +1571,22 @@ class ToxicCommentApp:
                 (idx + 1, value)
                 for idx, value in enumerate(self.df[text_col].fillna("").astype(str).tolist())
             ]
+            mode = getattr(self, "_dataset_mode_var", tk.StringVar(value="Full dataset")).get()
+            if mode != "Full dataset":
+                try:
+                    limit = max(1, min(len(records), int(self._dataset_limit_var.get())))
+                except (TypeError, ValueError):
+                    messagebox.showerror("Analyze Error", "Rows must be a positive whole number.")
+                    self._toxicity_analysis_busy = False
+                    self._set_toxicity_analyze_loading(False)
+                    return
+                if mode == "Random sample":
+                    import random
+                    records = random.Random(42).sample(records, limit)
+                    records.sort(key=lambda item: item[0])
+                else:
+                    records = records[:limit]
+                self._log(f"Dataset mode: {mode.lower()} ({len(records):,} rows selected).")
             self._set_dataset_analysis_pending_ui()
             self._log(
                 f"Dataset analysis started: analyzing all {len(records):,} rows from column '{text_col}'."
@@ -1599,6 +1638,8 @@ class ToxicCommentApp:
         result: dict[str, object] | None,
         err: BaseException | None,
     ) -> None:
+        if not self._toxicity_analysis_busy:
+            return
         self._toxicity_analysis_busy = False
         self._set_toxicity_analyze_loading(False)
         if err is not None:
@@ -1637,6 +1678,8 @@ class ToxicCommentApp:
         err: BaseException | None,
     ) -> None:
         """Apply analysis on the Tk main thread after background work completes."""
+        if not self._toxicity_analysis_busy:
+            return
         self._toxicity_analysis_busy = False
         self._set_toxicity_analyze_loading(False)
         if err is not None:
@@ -1770,20 +1813,29 @@ class ToxicCommentApp:
             return
         self._dataset_path = path
         self.file_var.set(path.name)
-        try:
-            if path.suffix.lower() == ".csv":
-                df = pd.read_csv(path, low_memory=True)
-            elif path.suffix.lower() in {".xlsx", ".xls"}:
-                df = pd.read_excel(path)
-            elif path.suffix.lower() == ".json":
-                df = pd.read_json(path)
-            else:
-                messagebox.showerror("Error", "Unsupported file format.")
-                return
-        except Exception as exc:
-            messagebox.showerror("Load Error", str(exc))
-            return
+        self._log(f"Loading dataset in background: {path.name}")
 
+        def worker() -> None:
+            try:
+                if path.suffix.lower() == ".csv":
+                    df = pd.read_csv(path, low_memory=True)
+                elif path.suffix.lower() in {".xlsx", ".xls"}:
+                    df = pd.read_excel(path)
+                elif path.suffix.lower() == ".json":
+                    df = pd.read_json(path)
+                else:
+                    raise ValueError("Unsupported file format.")
+                self.root.after(0, lambda: self._finish_dataset_load(path, df, None))
+            except Exception as exc:
+                self.root.after(0, lambda: self._finish_dataset_load(path, None, exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_dataset_load(self, path: Path, df: pd.DataFrame | None, error: Exception | None) -> None:
+        if error is not None:
+            messagebox.showerror("Load Error", str(error))
+            return
+        assert df is not None
         self.df = df
         text_col = self._detect_text_column(self.df)
         label_col = self._detect_label_column(self.df, text_col)
@@ -1800,7 +1852,41 @@ class ToxicCommentApp:
             self._log(f"Detected text column: {text_col}")
         if label_col:
             self._log(f"Detected label column: {label_col}")
-        self._scan_profanity()
+        # Do not block the UI while scanning every row.
+        text_col_for_scan = text_col
+        def scan_worker() -> None:
+            try:
+                result = self._scan_profanity_values(df, text_col_for_scan)
+                self.root.after(0, lambda: self._finish_profanity_scan(result))
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("Scan Error", str(exc)))
+        threading.Thread(target=scan_worker, daemon=True).start()
+
+    def _scan_profanity_values(self, df: pd.DataFrame, text_col: str) -> tuple[list[bool], list[int], list[str]]:
+        text_series = df[text_col].astype(str)
+        has_pf: list[bool] = []
+        prof_counts: list[int] = []
+        prof_matches: list[str] = []
+        for value in text_series:
+            result = self.profanity_scanner.scan_text(value)
+            has_pf.append(result.has_profanity)
+            prof_counts.append(result.profanity_count)
+            prof_matches.append(", ".join(result.matches))
+        return has_pf, prof_counts, prof_matches
+
+    def _finish_profanity_scan(self, result: tuple[list[bool], list[int], list[str]]) -> None:
+        if self.df is None:
+            return
+        has_pf, prof_counts, prof_matches = result
+        self.df["has_profanity"] = has_pf
+        self.df["profanity_count"] = prof_counts
+        self.df["profanity_matches"] = prof_matches
+        flagged = int(sum(has_pf))
+        total = len(has_pf)
+        pct = (flagged / total * 100.0) if total else 0.0
+        self._show_preview(self.df)
+        self._log(f"Profanity scan completed on column: {self.text_col_var.get()}")
+        self._log(f"Flagged rows: {flagged:,} / {total:,} ({pct:.2f}%)")
 
     def _load_dataset(self) -> None:
         if self._dataset_path is None:
@@ -1816,6 +1902,8 @@ class ToxicCommentApp:
     def _show_text_preview(self, text: str) -> None:
         # Preview panel removed; show in analysis input instead.
         if hasattr(self, "tox_input") and self.tox_input is not None:
+            self._preview_df = None
+            self._preview_text_snapshot = ""
             self.tox_input.delete("1.0", END)
             self.tox_input.insert("1.0", text)
             self.tox_input.see("1.0")
@@ -1824,10 +1912,13 @@ class ToxicCommentApp:
         # Preview panel removed; show dataset preview inside the analysis input.
         if not hasattr(self, "tox_input") or self.tox_input is None:
             return
+        self._preview_df = df
+        self._preview_next_row = 0
+        self._preview_columns = None
         self.tox_input.delete("1.0", END)
         # Use TSV-style preview to avoid padded right-aligned DataFrame formatting.
         n_show = min(len(df), UI_PREVIEW_MAX_ROWS)
-        preview_df = df.head(n_show).fillna("").astype(str)
+        preview_df = df.iloc[:n_show].fillna("").astype(str)
         preview_df = preview_df.apply(
             lambda col: col.str.replace("\n", "\\n", regex=False).str.replace("\t", " ", regex=False)
         )
@@ -1851,6 +1942,8 @@ class ToxicCommentApp:
         rest = [c for c in cols if c not in priority]
         if priority:
             preview_df = preview_df[priority + rest]
+        self._preview_columns = list(preview_df.columns)
+        self._preview_next_row = n_show
         preview_str = preview_df.to_csv(sep="\t", index=False)
         truncated = len(df) > n_show
         extra = (
@@ -1862,7 +1955,67 @@ class ToxicCommentApp:
             f"Dataset: {len(df):,} rows, {len(df.columns):,} columns{extra}\n\n"
         )
         self.tox_input.insert("1.0", header + preview_str)
+        self._preview_text_snapshot = self.tox_input.get("1.0", END).strip()
         self.tox_input.see("1.0")
+
+    def _sync_preview_to_df(self) -> None:
+        """Persist edits made in the paginated TSV preview into the in-memory dataframe."""
+        if self.df is None or not hasattr(self, "tox_input"):
+            return
+        current = self.tox_input.get("1.0", END).strip()
+        snapshot = getattr(self, "_preview_text_snapshot", "")
+        if not current.startswith("Dataset:") or current == snapshot:
+            return
+        try:
+            _, table = current.split("\n\n", 1)
+            edited = pd.read_csv(io.StringIO(table), sep="\t", dtype=str, keep_default_na=False)
+            count = min(len(edited), len(self.df))
+            for column in edited.columns:
+                if column in self.df.columns:
+                    self.df.loc[self.df.index[:count], column] = edited[column].iloc[:count].tolist()
+            self._log(f"Synchronized {count:,} edited preview rows to the in-memory dataset.")
+            self._preview_text_snapshot = current
+        except Exception as exc:
+            self._log(f"Preview synchronization skipped: {exc}")
+
+    def _preview_scroll_command(self, *args: str) -> None:
+        self.tox_input.yview(*args)
+        if getattr(self, "_preview_df", None) is None:
+            return
+        _first, last = self.tox_input.yview()
+        if last >= 0.98:
+            self._append_preview_page()
+
+    def _preview_mousewheel(self, event: tk.Event) -> None:
+        if getattr(self, "_preview_df", None) is None:
+            return None
+        self.tox_input.yview_scroll(-max(1, int(event.delta / 120)), "units")
+        _first, last = self.tox_input.yview()
+        if event.delta < 0 and last >= 0.95:
+            self._append_preview_page()
+        return "break"
+
+    def _report_dataset_progress(self, percent: float, done: int, total: int, ok: int, fail: int, minutes: float, rate: float) -> None:
+        self._dataset_progress_var.set(
+            f"Analysis: {percent:.1f}% — {done:,}/{total:,} rows — {rate:.2f} rows/sec"
+        )
+        self._log(
+            f"Dataset analysis progress: {percent:.2f}% complete "
+            f"({done:,}/{total:,} rows checked, {ok:,} analyzed, {fail:,} errors, "
+            f"{minutes:.1f} min, {rate:.2f} rows/sec)"
+        )
+
+    def _append_preview_page(self) -> None:
+        df = getattr(self, "_preview_df", None)
+        start = getattr(self, "_preview_next_row", 0)
+        cols = getattr(self, "_preview_columns", None)
+        if df is None or cols is None or start >= len(df):
+            return
+        end = min(len(df), start + UI_PREVIEW_MAX_ROWS)
+        page = df.iloc[start:end].reindex(columns=cols).fillna("").astype(str)
+        page = page.apply(lambda col: col.str.replace("\n", "\\n", regex=False).str.replace("\t", " ", regex=False))
+        self.tox_input.insert(END, page.to_csv(sep="\t", index=False, header=False))
+        self._preview_next_row = end
 
     def _processing_chunk_rows(self, text_sample: pd.Series) -> int:
         """Adaptive batch size: smaller chunks when texts are long (limits peak RAM)."""
@@ -2006,6 +2159,7 @@ class ToxicCommentApp:
         )
 
     def _apply_preprocessing(self) -> None:
+        self._sync_preview_to_df()
         try:
             text_series = self._get_text_series()
         except Exception as exc:
@@ -2052,6 +2206,7 @@ class ToxicCommentApp:
         )
 
     def _apply_augmentation(self) -> None:
+        self._sync_preview_to_df()
         if self.df is None:
             messagebox.showerror("Augmentation Error", "Dataset not loaded.")
             return
@@ -2080,6 +2235,7 @@ class ToxicCommentApp:
         return self.text_col_var.get()
 
     def _scan_profanity(self) -> None:
+        self._sync_preview_to_df()
         if self.df is None:
             messagebox.showerror("Scan Error", "Dataset not loaded.")
             return
@@ -2181,6 +2337,7 @@ class ToxicCommentApp:
         self._log(f"Rows changed: {changed:,} / {total:,}")
 
     def _investigate_architectures(self) -> None:
+        self._sync_preview_to_df()
         if not self._user.is_admin:
             return
         if self.df is None:
@@ -2214,6 +2371,7 @@ class ToxicCommentApp:
         )
 
     def _train_selected(self) -> None:
+        self._sync_preview_to_df()
         if not self._user.is_admin:
             return
         if self.df is None:

@@ -42,6 +42,16 @@ _DEFAULT_TYPES: tuple[str, ...] = (
     "Religious Intolerance",
 )
 
+_DEFAULT_BATCH_ROWS = 8
+_DEFAULT_BATCH_OUTPUT_TOKENS_PER_ROW = 40
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
+
 
 @dataclass(frozen=True)
 class ToxicityAnalysis:
@@ -156,7 +166,12 @@ class LocalToxicityAnalyzer:
                 f"Details: {exc}"
             ) from exc
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         if device.type == "cuda" and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
         else:
@@ -224,9 +239,11 @@ class LocalToxicityAnalyzer:
         self,
         items: list[tuple[int, str]],
         *,
-        max_rows_per_batch: int = 24,
+        max_rows_per_batch: int | None = None,
     ) -> list[list[tuple[int, str]]]:
         self._ensure_loaded()
+        if max_rows_per_batch is None:
+            max_rows_per_batch = _env_int("FYP_BATCH_ROWS", _DEFAULT_BATCH_ROWS, 1, 24)
         assert self._tokenizer is not None and self._model is not None
 
         context_window = _model_context_window(self._model, self._tokenizer)
@@ -268,7 +285,13 @@ class LocalToxicityAnalyzer:
             + "\n\nJSON:"
         )
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
-        max_new_tokens = max(512, min(4096, len(items) * 120))
+        per_row = _env_int(
+            "FYP_BATCH_OUTPUT_TOKENS_PER_ROW",
+            _DEFAULT_BATCH_OUTPUT_TOKENS_PER_ROW,
+            16,
+            120,
+        )
+        max_new_tokens = max(128, min(2048, len(items) * per_row))
 
         try:
             with torch.no_grad():
