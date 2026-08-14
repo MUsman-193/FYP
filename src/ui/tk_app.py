@@ -31,7 +31,7 @@ from moderation import (
 from preprocessing import PreprocessConfig, TextPreprocessor
 
 # Rows shown in the analysis textarea; full TSV previews are very RAM-heavy in Tk.
-UI_PREVIEW_MAX_ROWS = 750
+UI_PREVIEW_MAX_ROWS = 500
 # When suggesting preprocessing from stats, cap how many rows we scan at once.
 SUGGEST_SAMPLE_MAX_ROWS = 30_000
 # Single-message analyze: model cannot coherently classify an entire TSV preview.
@@ -365,6 +365,16 @@ class ToxicCommentApp:
         self.root = root
         self.root.title("Toxic Comment Classification Workbench")
         self.root.geometry("1280x800")
+        self.root.minsize(1100, 700)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TCombobox", padding=5, relief="flat")
+        style.configure("TEntry", padding=5)
+        style.configure("TButton", padding=(10, 6), font=("Segoe UI", 10))
+        style.configure("TLabel", font=("Segoe UI", 10))
 
         self._user = user
         self._on_logout = on_logout
@@ -690,6 +700,7 @@ class ToxicCommentApp:
         )
         apply_aug_btn.configure(height=34)
         apply_aug_btn.pack(fill="x", pady=(10, 0))
+        self._aug_apply_btn = apply_aug_btn
 
         if self._user.is_admin:
             model_frame = _sidebar_card(left, "Model Investigation")
@@ -921,11 +932,12 @@ class ToxicCommentApp:
             padx=10,
             pady=10,
         )
-        tox_input_v = ttk.Scrollbar(tox_input_wrap, orient="vertical", command=self._preview_scroll_command)
+        self._dataset_busy = False
+        tox_input_v = ttk.Scrollbar(tox_input_wrap, orient="vertical", command=self.tox_input.yview)
         self.tox_input.configure(yscrollcommand=tox_input_v.set)
         self.tox_input.grid(row=0, column=0, sticky="nsew")
         tox_input_v.grid(row=0, column=1, sticky="ns")
-        self.tox_input.bind("<MouseWheel>", self._preview_mousewheel, add="+")
+        self.tox_input.bind("<KeyRelease>", self._mark_preview_dirty, add="+")
         self._dataset_progress_var = tk.StringVar(value="Ready")
         tk.Label(
             input_card_inner,
@@ -951,6 +963,10 @@ class ToxicCommentApp:
         tk.Label(dataset_opts, text="Rows", bg=self._tox_card_bg, fg=self._tox_muted).pack(side="left")
         self._dataset_limit_var = tk.StringVar(value="1000")
         ttk.Entry(dataset_opts, textvariable=self._dataset_limit_var, width=8).pack(side="left", padx=(8, 0))
+        self._preview_segment_var = tk.StringVar(value="Segment 1")
+        ttk.Button(dataset_opts, text="Next", command=self._next_preview_segment).pack(side="right", padx=(4, 0))
+        ttk.Button(dataset_opts, text="Previous", command=self._previous_preview_segment).pack(side="right", padx=(4, 0))
+        tk.Label(dataset_opts, textvariable=self._preview_segment_var, bg=self._tox_card_bg, fg=self._tox_muted).pack(side="right")
 
         actions = tk.Frame(input_card_inner, bg=self._tox_card_bg)
         actions.pack(fill="x", pady=(12, 0))
@@ -1558,7 +1574,7 @@ class ToxicCommentApp:
         self._toxicity_cancel_event.clear()
         self._set_toxicity_analyze_loading(True)
 
-        is_dataset_preview = self.df is not None and text_raw.startswith("Dataset:") and "\n\n" in text_raw
+        is_dataset_preview = self.df is not None and getattr(self, "_preview_active", False)
         if is_dataset_preview:
             text_col = self.text_col_var.get().strip()
             if text_col not in self.df.columns:
@@ -1812,6 +1828,7 @@ class ToxicCommentApp:
             messagebox.showerror("Error", "Please select a valid dataset file.")
             return
         self._dataset_path = path
+        self._set_dataset_busy(True)
         self.file_var.set(path.name)
         self._log(f"Loading dataset in background: {path.name}")
 
@@ -1833,6 +1850,7 @@ class ToxicCommentApp:
 
     def _finish_dataset_load(self, path: Path, df: pd.DataFrame | None, error: Exception | None) -> None:
         if error is not None:
+            self._set_dataset_busy(False)
             messagebox.showerror("Load Error", str(error))
             return
         assert df is not None
@@ -1887,6 +1905,19 @@ class ToxicCommentApp:
         self._show_preview(self.df)
         self._log(f"Profanity scan completed on column: {self.text_col_var.get()}")
         self._log(f"Flagged rows: {flagged:,} / {total:,} ({pct:.2f}%)")
+        self._set_dataset_busy(False)
+
+    def _set_dataset_busy(self, busy: bool) -> None:
+        self._dataset_busy = busy
+        if hasattr(self, "_dataset_progress_var"):
+            self._dataset_progress_var.set("Working… controls are temporarily locked" if busy else "Ready")
+        state = "disabled" if busy else "normal"
+        if hasattr(self, "tox_input"):
+            self.tox_input.configure(state=state)
+        for name in ("_prep_apply_btn", "_aug_apply_btn", "analyze_btn", "upload_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.set_enabled(not busy)
 
     def _load_dataset(self) -> None:
         if self._dataset_path is None:
@@ -1903,7 +1934,9 @@ class ToxicCommentApp:
         # Preview panel removed; show in analysis input instead.
         if hasattr(self, "tox_input") and self.tox_input is not None:
             self._preview_df = None
+            self._preview_active = False
             self._preview_text_snapshot = ""
+            self._preview_dirty = False
             self.tox_input.delete("1.0", END)
             self.tox_input.insert("1.0", text)
             self.tox_input.see("1.0")
@@ -1912,13 +1945,22 @@ class ToxicCommentApp:
         # Preview panel removed; show dataset preview inside the analysis input.
         if not hasattr(self, "tox_input") or self.tox_input is None:
             return
+        same_dataset = getattr(self, "_preview_df", None) is df
         self._preview_df = df
-        self._preview_next_row = 0
+        self._preview_active = True
+        if not same_dataset:
+            self._preview_segment = 0
         self._preview_columns = None
         self.tox_input.delete("1.0", END)
         # Use TSV-style preview to avoid padded right-aligned DataFrame formatting.
-        n_show = min(len(df), UI_PREVIEW_MAX_ROWS)
-        preview_df = df.iloc[:n_show].fillna("").astype(str)
+        start = getattr(self, "_preview_segment", 0) * UI_PREVIEW_MAX_ROWS
+        n_show = min(max(0, len(df) - start), UI_PREVIEW_MAX_ROWS)
+        preview_df = df.iloc[start : start + n_show].fillna("").astype(str)
+        # The editor shows only the source text column. Derived text and label
+        # columns remain in the dataframe but are not editable preview content.
+        source_preview_col = self.text_col_var.get().strip()
+        if source_preview_col in preview_df.columns:
+            preview_df = preview_df[[source_preview_col]]
         preview_df = preview_df.apply(
             lambda col: col.str.replace("\n", "\\n", regex=False).str.replace("\t", " ", regex=False)
         )
@@ -1944,19 +1986,24 @@ class ToxicCommentApp:
             preview_df = preview_df[priority + rest]
         self._preview_columns = list(preview_df.columns)
         self._preview_next_row = n_show
-        preview_str = preview_df.to_csv(sep="\t", index=False)
-        truncated = len(df) > n_show
-        extra = (
-            f" (preview: first {n_show:,} rows only)"
-            if truncated
-            else ""
-        )
+        if len(preview_df.columns) == 1:
+            preview_str = "\n".join(preview_df.iloc[:, 0].astype(str).tolist()) + "\n"
+        else:
+            preview_str = preview_df.to_csv(sep="\t", index=False, header=False)
+        segment_end = min(len(df), start + n_show)
+        extra = f" (rows {start + 1:,}–{segment_end:,})"
         header = (
             f"Dataset: {len(df):,} rows, {len(df.columns):,} columns{extra}\n\n"
         )
-        self.tox_input.insert("1.0", header + preview_str)
+        self.tox_input.insert("1.0", preview_str)
+        total_segments = max(1, (len(df) + UI_PREVIEW_MAX_ROWS - 1) // UI_PREVIEW_MAX_ROWS)
+        self._preview_segment_var.set(f"Segment {getattr(self, '_preview_segment', 0) + 1} / {total_segments}")
         self._preview_text_snapshot = self.tox_input.get("1.0", END).strip()
+        self._preview_dirty = False
         self.tox_input.see("1.0")
+
+    def _mark_preview_dirty(self, _event: tk.Event | None = None) -> None:
+        self._preview_dirty = True
 
     def _sync_preview_to_df(self) -> None:
         """Persist edits made in the paginated TSV preview into the in-memory dataframe."""
@@ -1964,35 +2011,45 @@ class ToxicCommentApp:
             return
         current = self.tox_input.get("1.0", END).strip()
         snapshot = getattr(self, "_preview_text_snapshot", "")
-        if not current.startswith("Dataset:") or current == snapshot:
+        if not getattr(self, "_preview_active", False) or (not getattr(self, "_preview_dirty", False) and current == snapshot):
             return
         try:
-            _, table = current.split("\n\n", 1)
-            edited = pd.read_csv(io.StringIO(table), sep="\t", dtype=str, keep_default_na=False)
-            count = min(len(edited), len(self.df))
-            for column in edited.columns:
-                if column in self.df.columns:
-                    self.df.loc[self.df.index[:count], column] = edited[column].iloc[:count].tolist()
+            start = getattr(self, "_preview_segment", 0) * UI_PREVIEW_MAX_ROWS
+            label_col = self.label_col_var.get().strip()
+            editable_names = {
+                self.text_col_var.get().strip(),
+                "processed_text",
+                "augmented_text",
+                "clean_text",
+                "clean_replacements",
+            }
+            columns = [
+                c for c in (getattr(self, "_preview_columns", None) or [])
+                if c in self.df.columns and c != label_col and c in editable_names
+            ]
+            rows = [line.split("\t") for line in current.splitlines() if line.strip()]
+            segment_len = min(UI_PREVIEW_MAX_ROWS, len(self.df) - start)
+            count = min(len(rows), segment_len)
+            for offset in range(segment_len):
+                row_index = self.df.index[start + offset]
+                values = rows[offset] if offset < count else []
+                for col_index, column in enumerate(columns):
+                    value = values[col_index] if col_index < len(values) else ""
+                    self.df.at[row_index, column] = value
             self._log(f"Synchronized {count:,} edited preview rows to the in-memory dataset.")
             self._preview_text_snapshot = current
+            self._preview_dirty = False
         except Exception as exc:
             self._log(f"Preview synchronization skipped: {exc}")
 
     def _preview_scroll_command(self, *args: str) -> None:
         self.tox_input.yview(*args)
-        if getattr(self, "_preview_df", None) is None:
-            return
-        _first, last = self.tox_input.yview()
-        if last >= 0.98:
-            self._append_preview_page()
 
     def _preview_mousewheel(self, event: tk.Event) -> None:
         if getattr(self, "_preview_df", None) is None:
             return None
         self.tox_input.yview_scroll(-max(1, int(event.delta / 120)), "units")
         _first, last = self.tox_input.yview()
-        if event.delta < 0 and last >= 0.95:
-            self._append_preview_page()
         return "break"
 
     def _report_dataset_progress(self, percent: float, done: int, total: int, ok: int, fail: int, minutes: float, rate: float) -> None:
@@ -2110,23 +2167,28 @@ class ToxicCommentApp:
         return True, ""
 
     def _suggest_preprocessing(self) -> None:
+        if self._dataset_busy:
+            return
+        self._set_dataset_busy(True)
         try:
             series = self._get_text_series()
-            n_total = len(series)
-            if n_total > SUGGEST_SAMPLE_MAX_ROWS:
-                texts = (
-                    series.sample(n=SUGGEST_SAMPLE_MAX_ROWS, random_state=42).tolist()
-                )
-                self._log(
-                    f"Suggest preprocessing: sampled {SUGGEST_SAMPLE_MAX_ROWS:,} "
-                    f"of {n_total:,} rows (memory-efficient)."
-                )
-            else:
-                texts = series.tolist()
-            cfg, stats = self.preprocessor.suggest(texts)
+            texts = series.tolist()
+            self._log(f"Suggest preprocessing: analyzed all {len(texts):,} rows.")
         except Exception as exc:
+            self._set_dataset_busy(False)
             messagebox.showerror("Suggestion Error", str(exc))
             return
+
+        def worker() -> None:
+            try:
+                cfg, stats = self.preprocessor.suggest(texts)
+                self.root.after(0, lambda: self._finish_preprocessing_suggestion(cfg, stats))
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("Suggestion Error", str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_preprocessing_suggestion(self, cfg: PreprocessConfig, stats: dict[str, object]) -> None:
+        self._set_dataset_busy(False)
 
         self.prep_vars["normalize_unicode"].set(cfg.normalize_unicode)
         self.prep_vars["remove_noise"].set(cfg.remove_noise)
@@ -2159,6 +2221,8 @@ class ToxicCommentApp:
         )
 
     def _apply_preprocessing(self) -> None:
+        if self._dataset_busy:
+            return
         self._sync_preview_to_df()
         try:
             text_series = self._get_text_series()
@@ -2170,17 +2234,22 @@ class ToxicCommentApp:
 
         cfg = self._build_prep_config()
         n = len(self.df)
-        chunk = self._processing_chunk_rows(text_series)
-        out: list[str] = []
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            slab = text_series.iloc[start:end]
-            for t in slab:
-                out.append(self.preprocessor.apply(t, cfg))
+        self._set_dataset_busy(True)
+        self._prep_apply_btn.set_enabled(False)
+        def worker() -> None:
+            out = [self.preprocessor.apply(str(t), cfg) for t in text_series]
+            self.root.after(0, lambda: self._finish_preprocessing(out))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_preprocessing(self, out: list[str]) -> None:
+        self._set_dataset_busy(False)
+        if self.df is None:
+            return
         self.df["processed_text"] = out
         gc.collect()
         self._show_preview(self.df)
         self._log("Applied preprocessing. Output column: processed_text")
+        self._update_preprocessing_apply_state()
 
     def _update_preprocessing_apply_state(self) -> None:
         btn = getattr(self, "_prep_apply_btn", None)
@@ -2206,24 +2275,32 @@ class ToxicCommentApp:
         )
 
     def _apply_augmentation(self) -> None:
+        if self._dataset_busy:
+            return
         self._sync_preview_to_df()
         if self.df is None:
             messagebox.showerror("Augmentation Error", "Dataset not loaded.")
             return
         source_col = "processed_text" if "processed_text" in self.df.columns else self.text_col_var.get()
         cfg = self._build_aug_config()
+        self._set_dataset_busy(True)
         src = self.df[source_col].astype(str)
-        n = len(self.df)
-        chunk = self._processing_chunk_rows(src)
-        out: list[str] = []
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            for t in src.iloc[start:end]:
-                out.append(self.augmenter.apply(t, cfg))
-        self.df["augmented_text"] = out
-        gc.collect()
-        self._show_preview(self.df)
-        self._log(f"Applied augmentation on {source_col}. Output column: augmented_text")
+        if hasattr(self, "_aug_apply_btn"):
+            self._aug_apply_btn.set_enabled(False)
+        def worker() -> None:
+            out = [self.augmenter.apply(str(t), cfg) for t in src]
+            self.root.after(0, lambda: finish(out))
+        def finish(out: list[str]) -> None:
+            self._set_dataset_busy(False)
+            if self.df is None:
+                return
+            self.df["augmented_text"] = out
+            gc.collect()
+            self._show_preview(self.df)
+            self._log(f"Applied augmentation on {source_col}. Output column: augmented_text")
+            if hasattr(self, "_aug_apply_btn"):
+                self._aug_apply_btn.set_enabled(True)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _training_text_column(self) -> str:
         if self.df is None:
@@ -2247,35 +2324,14 @@ class ToxicCommentApp:
             if text_col not in self.df.columns:
                 raise ValueError("Please select a valid text column.")
 
-            text_series = self.df[text_col].astype(str)
-            n_rows = len(text_series)
-            chunk = self._processing_chunk_rows(text_series)
-            has_pf = [False] * n_rows
-            prof_counts = [0] * n_rows
-            prof_matches = [""] * n_rows
-            for start in range(0, n_rows, chunk):
-                end = min(start + chunk, n_rows)
-                for idx in range(start, end):
-                    r = self.profanity_scanner.scan_text(text_series.iloc[idx])
-                    has_pf[idx] = r.has_profanity
-                    prof_counts[idx] = r.profanity_count
-                    prof_matches[idx] = ", ".join(r.matches)
+            text_values = self.df[text_col].astype(str).tolist()
         except Exception as exc:
             messagebox.showerror("Scan Error", str(exc))
             return
-
-        self.df["has_profanity"] = has_pf
-        self.df["profanity_count"] = prof_counts
-        self.df["profanity_matches"] = prof_matches
-        gc.collect()
-
-        flagged = int(sum(self.df["has_profanity"].astype(bool)))
-        total = int(len(self.df))
-        pct = (flagged / total * 100.0) if total else 0.0
-
-        self._show_preview(self.df)
-        self._log(f"Profanity scan completed on column: {text_col}")
-        self._log(f"Flagged rows: {flagged:,} / {total:,} ({pct:.2f}%)")
+        def worker() -> None:
+            result = self._scan_profanity_values(pd.DataFrame({text_col: text_values}), text_col)
+            self.root.after(0, lambda: self._finish_profanity_scan(result))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _clean_profanity(self) -> None:
         if self.df is None:
@@ -2706,3 +2762,22 @@ class ToxicCommentApp:
     def _preview_text_focus_in(self, _event: tk.Event) -> None:
         # Preview panel removed
         return
+
+    def _next_preview_segment(self) -> None:
+        df = getattr(self, "_preview_df", None)
+        if df is None:
+            return
+        self._sync_preview_to_df()
+        total = max(1, (len(df) + UI_PREVIEW_MAX_ROWS - 1) // UI_PREVIEW_MAX_ROWS)
+        if self._preview_segment + 1 < total:
+            self._preview_segment += 1
+            self._show_preview(df)
+
+    def _previous_preview_segment(self) -> None:
+        df = getattr(self, "_preview_df", None)
+        if df is None:
+            return
+        self._sync_preview_to_df()
+        if self._preview_segment > 0:
+            self._preview_segment -= 1
+            self._show_preview(df)

@@ -13,12 +13,12 @@ class AuthFrame(ttk.Frame):
     """Username/password login with optional registration."""
 
     # Tailwind-ish palette (to mimic the React/Tailwind design)
-    _BG = "#E6E6E7"
+    _BG = "#F3F6FA"
     _CARD_BG = "#ffffff"
     _BORDER = "#e5e7eb"
     _TEXT = "#111827"
     _MUTED = "#6b7280"
-    _PRIMARY = "#2563eb"
+    _PRIMARY = "#1D4ED8"
     _PRIMARY_HOVER = "#1d4ed8"
     _DESTRUCTIVE = "#dc2626"
 
@@ -129,7 +129,7 @@ class AuthFrame(ttk.Frame):
 
         card_canvas, card_inner = self._build_rounded_shadow_card(
             bg,
-            width=440,
+            width=460,
             radius=18,
             shadow_dx=0,
             shadow_dy=0,
@@ -138,7 +138,7 @@ class AuthFrame(ttk.Frame):
         card_canvas.grid(row=1, column=0, padx=18, pady=18, sticky="n")
         content = card_inner
 
-        tk.Label(content, text="Welcome back", bg=self._CARD_BG, fg=self._TEXT, font=("Segoe UI", 18, "bold")).pack(
+        tk.Label(content, text="Welcome back", bg=self._CARD_BG, fg=self._TEXT, font=("Segoe UI", 22, "bold")).pack(
             anchor="w"
         )
         tk.Label(
@@ -191,21 +191,32 @@ class AuthFrame(ttk.Frame):
         self.user_entry.focus_set()
         self.bind("<Return>", lambda _e: self._submit())
 
-    def _btn_primary(self, parent: tk.Misc, *, text: str, command: Callable[[], None]) -> tk.Button:
-        btn = tk.Button(
+    def _btn_primary(self, parent: tk.Misc, *, text: str, command: Callable[[], None]) -> ttk.Button:
+        style = ttk.Style(parent)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "AuthPrimary.TButton",
+            background=self._PRIMARY,
+            foreground="#ffffff",
+            borderwidth=0,
+            relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            padding=(16, 11),
+        )
+        style.map(
+            "AuthPrimary.TButton",
+            background=[("active", self._PRIMARY_HOVER), ("disabled", "#dbeafe")],
+            foreground=[("disabled", "#64748b")],
+        )
+        btn = ttk.Button(
             parent,
             text=text,
             command=command,
-            bg=self._PRIMARY,
-            fg="#ffffff",
-            activebackground=self._PRIMARY_HOVER,
-            activeforeground="#ffffff",
-            bd=0,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
+            style="AuthPrimary.TButton",
             cursor="hand2",
-            padx=14,
-            pady=10,
         )
         return btn
 
@@ -250,7 +261,9 @@ class AuthFrame(ttk.Frame):
         entry = tk.Entry(
             row,
             bd=0,
+            borderwidth=0,
             relief="flat",
+            highlightthickness=0,
             font=("Segoe UI", 10),
             fg=self._TEXT,
             bg=self._CARD_BG,
@@ -261,11 +274,13 @@ class AuthFrame(ttk.Frame):
         entry.configure(fg=self._MUTED)
 
         def on_focus_in(_e: tk.Event) -> None:
+            row.configure(highlightbackground=self._PRIMARY, highlightthickness=2)
             if entry.get() == placeholder and entry.cget("fg") == self._MUTED:
                 entry.delete(0, "end")
                 entry.configure(fg=self._TEXT)
 
         def on_focus_out(_e: tk.Event) -> None:
+            row.configure(highlightbackground=self._BORDER, highlightthickness=1)
             if not entry.get().strip():
                 entry.insert(0, placeholder)
                 entry.configure(fg=self._MUTED)
@@ -300,7 +315,9 @@ class AuthFrame(ttk.Frame):
         entry = tk.Entry(
             row,
             bd=0,
+            borderwidth=0,
             relief="flat",
+            highlightthickness=0,
             show="*",
             font=("Segoe UI", 10),
             fg=self._TEXT,
@@ -312,11 +329,13 @@ class AuthFrame(ttk.Frame):
         entry.configure(fg=self._MUTED)
 
         def on_focus_in(_e: tk.Event) -> None:
+            row.configure(highlightbackground=self._PRIMARY, highlightthickness=2)
             if entry.get() == placeholder and entry.cget("fg") == self._MUTED:
                 entry.delete(0, "end")
                 entry.configure(fg=self._TEXT)
 
         def on_focus_out(_e: tk.Event) -> None:
+            row.configure(highlightbackground=self._BORDER, highlightthickness=1)
             if not entry.get().strip():
                 entry.insert(0, placeholder)
                 entry.configure(fg=self._MUTED)
@@ -329,12 +348,15 @@ class AuthFrame(ttk.Frame):
             text="Show",
             bd=0,
             relief="flat",
-            bg=self._CARD_BG,
-            fg=self._MUTED,
-            activebackground=self._CARD_BG,
-            activeforeground=self._TEXT,
+            bg="#eff6ff",
+            fg=self._PRIMARY,
+            activebackground="#dbeafe",
+            activeforeground=self._PRIMARY_HOVER,
             cursor="hand2",
             font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            highlightthickness=0,
         )
         btn.grid(row=0, column=2, padx=(0, 10), pady=6, sticky="e")
 
