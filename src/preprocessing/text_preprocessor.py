@@ -389,6 +389,10 @@ class TextPreprocessor:
             )
         if config.normalize_whitespace:
             text = re.sub(r"\s+", " ", text).strip()
+        elif not text.strip():
+            # If cleanup removed all meaningful content, treat the row as empty
+            # instead of preserving leftover spaces/newlines in the preview.
+            text = ""
 
         return text
 

@@ -1576,7 +1576,7 @@ class ToxicCommentApp:
 
         is_dataset_preview = self.df is not None and getattr(self, "_preview_active", False)
         if is_dataset_preview:
-            text_col = self.text_col_var.get().strip()
+            text_col = self._active_text_column()
             if text_col not in self.df.columns:
                 self._toxicity_analysis_busy = False
                 self._set_toxicity_analyze_loading(False)
@@ -1956,9 +1956,11 @@ class ToxicCommentApp:
         start = getattr(self, "_preview_segment", 0) * UI_PREVIEW_MAX_ROWS
         n_show = min(max(0, len(df) - start), UI_PREVIEW_MAX_ROWS)
         preview_df = df.iloc[start : start + n_show].fillna("").astype(str)
-        # The editor shows only the source text column. Derived text and label
-        # columns remain in the dataframe but are not editable preview content.
-        source_preview_col = self.text_col_var.get().strip()
+        # Show the text version that subsequent actions will actually use.
+        # Once preprocessing/augmentation/cleaning has produced a derived
+        # column, continuing to show the original column is misleading and
+        # makes successful cleanup appear to have done nothing.
+        source_preview_col = self._active_text_column()
         if source_preview_col in preview_df.columns:
             preview_df = preview_df[[source_preview_col]]
         preview_df = preview_df.apply(
@@ -2121,10 +2123,20 @@ class ToxicCommentApp:
     def _get_text_series(self) -> pd.Series:
         if self.df is None:
             raise ValueError("Dataset not loaded.")
-        col = self.text_col_var.get().strip()
+        col = self._active_text_column()
         if col not in self.df.columns:
             raise ValueError("Please select a valid text column.")
         return self.df[col].astype(str)
+
+    def _active_text_column(self) -> str:
+        """Return the single text column currently shown and used by actions."""
+        selected = self.text_col_var.get().strip()
+        if self.df is None:
+            return selected
+        for column in ("clean_text", "augmented_text", "processed_text"):
+            if column in self.df.columns:
+                return column
+        return selected
 
     def _get_label_series(self) -> pd.Series:
         if self.df is None:
@@ -2245,6 +2257,11 @@ class ToxicCommentApp:
         self._set_dataset_busy(False)
         if self.df is None:
             return
+        # A newly processed version invalidates downstream derived versions.
+        self.df.drop(
+            columns=[c for c in ("augmented_text", "clean_text", "clean_replacements") if c in self.df.columns],
+            inplace=True,
+        )
         self.df["processed_text"] = out
         gc.collect()
         self._show_preview(self.df)
@@ -2294,6 +2311,10 @@ class ToxicCommentApp:
             self._set_dataset_busy(False)
             if self.df is None:
                 return
+            self.df.drop(
+                columns=[c for c in ("clean_text", "clean_replacements") if c in self.df.columns],
+                inplace=True,
+            )
             self.df["augmented_text"] = out
             gc.collect()
             self._show_preview(self.df)
@@ -2305,11 +2326,7 @@ class ToxicCommentApp:
     def _training_text_column(self) -> str:
         if self.df is None:
             raise ValueError("Dataset not loaded.")
-        if "augmented_text" in self.df.columns:
-            return "augmented_text"
-        if "processed_text" in self.df.columns:
-            return "processed_text"
-        return self.text_col_var.get()
+        return self._active_text_column()
 
     def _scan_profanity(self) -> None:
         self._sync_preview_to_df()
