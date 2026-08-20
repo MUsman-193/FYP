@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import gc
 import io
+import random
 import threading
 import time
 from tkinter import END, Tk, filedialog, messagebox
@@ -43,6 +44,22 @@ _HISTORY_METRIC_ORDER = (
     "Profanity",
     "Threat",
 )
+
+
+def _select_dataset_records(
+    records: list[tuple[int, str]],
+    requested_rows: int,
+    *,
+    seed: int = 42,
+) -> list[tuple[int, str]]:
+    """Return all records or a reproducible random sample in source-row order."""
+    if requested_rows < 1:
+        raise ValueError("Rows to analyze must be a positive whole number.")
+    if requested_rows >= len(records):
+        return list(records)
+    selected = random.Random(seed).sample(records, requested_rows)
+    selected.sort(key=lambda item: item[0])
+    return selected
 
 
 def _format_history_scores_line(*, overall: int, metrics: dict[str, int]) -> str:
@@ -955,21 +972,22 @@ class ToxicCommentApp:
             font=("Segoe UI", 9),
         ).pack(fill="x", pady=(6, 0))
 
-        # Dataset controls keep large jobs bounded while still allowing full runs.
+        # Row limit controls analysis size; preview navigation remains separate.
         dataset_opts = tk.Frame(input_card_inner, bg=self._tox_card_bg)
         dataset_opts.pack(fill="x", pady=(10, 0))
-        tk.Label(dataset_opts, text="Dataset mode", bg=self._tox_card_bg, fg=self._tox_muted).pack(side="left")
-        self._dataset_mode_var = tk.StringVar(value="Full dataset")
-        ttk.Combobox(
+        tk.Label(
             dataset_opts,
-            textvariable=self._dataset_mode_var,
-            values=("Full dataset", "First N rows", "Random sample"),
-            state="readonly",
-            width=16,
-        ).pack(side="left", padx=(8, 14))
-        tk.Label(dataset_opts, text="Rows", bg=self._tox_card_bg, fg=self._tox_muted).pack(side="left")
+            text="Rows to analyze",
+            bg=self._tox_card_bg,
+            fg=self._tox_muted,
+        ).pack(side="left")
         self._dataset_limit_var = tk.StringVar(value="1000")
-        ttk.Entry(dataset_opts, textvariable=self._dataset_limit_var, width=8).pack(side="left", padx=(8, 0))
+        self._dataset_limit_entry = ttk.Entry(
+            dataset_opts,
+            textvariable=self._dataset_limit_var,
+            width=9,
+        )
+        self._dataset_limit_entry.pack(side="left", padx=(8, 0))
         self._preview_segment_var = tk.StringVar(value="Segment 1")
         ttk.Button(dataset_opts, text="Next", command=self._next_preview_segment).pack(side="right", padx=(4, 0))
         ttk.Button(dataset_opts, text="Previous", command=self._previous_preview_segment).pack(side="right", padx=(4, 0))
@@ -1276,6 +1294,7 @@ class ToxicCommentApp:
             return
         up = getattr(self, "upload_btn", None)
         cancel = getattr(self, "cancel_analysis_btn", None)
+        row_limit = getattr(self, "_dataset_limit_entry", None)
         if loading:
             self._analyze_btn_idle_label = getattr(self, "_analyze_btn_idle_label", "Analyze")
             btn.set_text("Analyzing...")
@@ -1285,6 +1304,8 @@ class ToxicCommentApp:
             if cancel is not None:
                 cancel.set_text("Cancel")
                 cancel.set_enabled(True)
+            if row_limit is not None:
+                row_limit.configure(state="disabled")
             self._set_toxicity_download_ready(None)
             self.root.update_idletasks()
         else:
@@ -1295,6 +1316,8 @@ class ToxicCommentApp:
             if cancel is not None:
                 cancel.set_text("Cancel")
                 cancel.set_enabled(False)
+            if row_limit is not None:
+                row_limit.configure(state="normal")
             self.root.update_idletasks()
 
     def _text_for_single_toxicity_analyze(self, text_raw: str) -> tuple[str, str | None]:
@@ -1570,9 +1593,13 @@ class ToxicCommentApp:
             "cancelled": cancelled,
         }
 
-    def _set_dataset_analysis_pending_ui(self) -> None:
+    def _set_dataset_analysis_pending_ui(self, selected_rows: int, dataset_rows: int) -> None:
         self.overall_pct_label.configure(text="...", fg=self._tox_muted, bg=self._tox_green_bg)
-        self.overall_badge.configure(text="Analyzing full dataset", fg=self._tox_muted, bg=self._tox_green_bg)
+        self.overall_badge.configure(
+            text=f"Analyzing {selected_rows:,} of {dataset_rows:,} rows",
+            fg=self._tox_muted,
+            bg=self._tox_green_bg,
+        )
         self._overall_score_title_label.configure(bg=self._tox_green_bg, fg=self._tox_muted)
         self._overall_score_card.set_card_background(self._tox_green_bg)
 
@@ -1617,25 +1644,28 @@ class ToxicCommentApp:
                 (idx + 1, value)
                 for idx, value in enumerate(self.df[text_col].fillna("").astype(str).tolist())
             ]
-            mode = getattr(self, "_dataset_mode_var", tk.StringVar(value="Full dataset")).get()
-            if mode != "Full dataset":
-                try:
-                    limit = max(1, min(len(records), int(self._dataset_limit_var.get())))
-                except (TypeError, ValueError):
-                    messagebox.showerror("Analyze Error", "Rows must be a positive whole number.")
-                    self._toxicity_analysis_busy = False
-                    self._set_toxicity_analyze_loading(False)
-                    return
-                if mode == "Random sample":
-                    import random
-                    records = random.Random(42).sample(records, limit)
-                    records.sort(key=lambda item: item[0])
-                else:
-                    records = records[:limit]
-                self._log(f"Dataset mode: {mode.lower()} ({len(records):,} rows selected).")
-            self._set_dataset_analysis_pending_ui()
+            total_dataset_rows = len(records)
+            try:
+                requested_rows = int(self._dataset_limit_var.get())
+                records = _select_dataset_records(records, requested_rows)
+            except (TypeError, ValueError):
+                messagebox.showerror(
+                    "Analyze Error",
+                    "Rows to analyze must be a positive whole number.",
+                )
+                self._toxicity_analysis_busy = False
+                self._set_toxicity_analyze_loading(False)
+                return
+            self._set_dataset_analysis_pending_ui(len(records), total_dataset_rows)
+            if len(records) < total_dataset_rows:
+                self._log(
+                    f"Randomly sampled {len(records):,} of {total_dataset_rows:,} dataset rows "
+                    "for analysis."
+                )
+            else:
+                self._log(f"All {total_dataset_rows:,} dataset rows selected for analysis.")
             self._log(
-                f"Dataset analysis started: analyzing all {len(records):,} rows from column '{text_col}'."
+                f"Dataset analysis started: analyzing {len(records):,} rows from column '{text_col}'."
             )
 
             def dataset_worker() -> None:
@@ -1949,6 +1979,9 @@ class ToxicCommentApp:
         state = "disabled" if busy else "normal"
         if hasattr(self, "tox_input"):
             self.tox_input.configure(state=state)
+        row_limit = getattr(self, "_dataset_limit_entry", None)
+        if row_limit is not None:
+            row_limit.configure(state=state)
         for name in ("_prep_apply_btn", "_aug_apply_btn", "analyze_btn", "upload_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
