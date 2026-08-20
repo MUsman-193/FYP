@@ -25,7 +25,6 @@ from moderation import (
     ProfanityScanner,
     ToxicityAnalysis,
     ToxicityTextMetricsBundle,
-    metrics_from_llm_prediction,
     preprocess_and_analyze_single,
 )
 from preprocessing import PreprocessConfig, TextPreprocessor
@@ -462,10 +461,18 @@ class ToxicCommentApp:
                 try:
                     import torch
 
-                    if torch.cuda.is_available():
-                        self._log(f"Local toxicity model loaded on GPU: {torch.cuda.get_device_name(0)}")
+                    if analyzer.device_type == "cuda":
+                        self._log(
+                            "Local toxicity model loaded on GPU: "
+                            f"{torch.cuda.get_device_name(0)} ({analyzer.dtype_name})."
+                        )
+                    elif analyzer.device_type == "mps":
+                        self._log(
+                            "Local toxicity model loaded on Apple GPU (MPS, "
+                            f"{analyzer.dtype_name})."
+                        )
                     else:
-                        self._log("Local toxicity model loaded on CPU.")
+                        self._log(f"Local toxicity model loaded on CPU ({analyzer.dtype_name}).")
                 except Exception:
                     self._log("Local toxicity model loaded.")
 
@@ -1385,11 +1392,8 @@ class ToxicCommentApp:
 
         def handle_result(row_number: int, raw: str, analysis: ToxicityAnalysis) -> None:
             nonlocal analyzed, overall_sum, top_examples
-            metrics, overall = metrics_from_llm_prediction(
-                toxicity_level=analysis.toxicity_level,
-                toxicity_types=list(analysis.toxicity_type),
-                categories=list(analysis.category),
-            )
+            metrics = dict(analysis.scores)
+            overall = int(analysis.overall_score)
             analyzed += 1
             overall_sum += int(overall)
             for metric_name in _HISTORY_METRIC_ORDER:
@@ -1416,8 +1420,11 @@ class ToxicCommentApp:
                     ]
                 )
             )
-            top_examples.append((int(overall), row_number, preview))
-            top_examples = sorted(top_examples, key=lambda item: item[0], reverse=True)[:5]
+            # A zero-score comment is non-toxic and must never appear under the
+            # "Top toxic examples" heading.
+            if overall > 0:
+                top_examples.append((overall, row_number, preview))
+                top_examples = sorted(top_examples, key=lambda item: item[0], reverse=True)[:5]
 
         for batch_index, batch in enumerate(batches, start=1):
             if self._toxicity_cancel_event.is_set():
@@ -1443,8 +1450,31 @@ class ToxicCommentApp:
                     bs=batch_size: self._report_dataset_progress(percent, done, total, ok, fail, seconds / 60, rps),
                 )
             try:
-                for row_number, analysis in self.toxicity_analyzer.analyze_batch(batch):
+                batch_results = self.toxicity_analyzer.analyze_batch(batch)
+                returned_rows = {row_number for row_number, _analysis in batch_results}
+                for row_number, analysis in batch_results:
                     handle_result(row_number, raw_by_row.get(row_number, ""), analysis)
+                missing_items = [item for item in batch if item[0] not in returned_rows]
+                if missing_items:
+                    missing_ids = [row_number for row_number, _processed in missing_items]
+                    self.root.after(
+                        0,
+                        lambda bi=batch_index, found=len(batch_results), expected=len(batch), ids=missing_ids: self._log(
+                            f"Batch {bi} returned {found}/{expected} rows; retrying only missing rows: "
+                            f"{ids[:8]}{'...' if len(ids) > 8 else ''}"
+                        ),
+                    )
+                    for row_number, processed in missing_items:
+                        if self._toxicity_cancel_event.is_set():
+                            cancelled = True
+                            break
+                        try:
+                            analysis = self.toxicity_analyzer.analyze(processed)
+                            handle_result(row_number, raw_by_row.get(row_number, ""), analysis)
+                        except Exception as row_exc:
+                            errors.append(f"Row {row_number}: {row_exc}")
+                    if cancelled:
+                        break
             except Exception as exc:
                 errors.append(
                     f"Batch {batch_index} ({len(batch)} rows) failed; falling back row-by-row: {exc}"
@@ -1722,7 +1752,7 @@ class ToxicCommentApp:
         if expl:
             summary += f"- Explanation: {expl}\n"
         summary += (
-            f"- UI Score (derived): {overall}%\n"
+            f"- Overall Score (model): {overall}%\n"
             f"  - Toxicity: {metrics['Toxicity']}%\n"
             f"  - Severe Toxicity: {metrics['Severe Toxicity']}%\n"
             f"  - Identity Attack: {metrics['Identity Attack']}%\n"
@@ -1877,8 +1907,13 @@ class ToxicCommentApp:
                 result = self._scan_profanity_values(df, text_col_for_scan)
                 self.root.after(0, lambda: self._finish_profanity_scan(result))
             except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("Scan Error", str(exc)))
+                self.root.after(0, lambda error=exc: self._finish_initial_scan_error(error))
         threading.Thread(target=scan_worker, daemon=True).start()
+
+    def _finish_initial_scan_error(self, error: Exception) -> None:
+        """Unlock dataset controls if the automatic post-load scan fails."""
+        self._set_dataset_busy(False)
+        messagebox.showerror("Scan Error", str(error))
 
     def _scan_profanity_values(self, df: pd.DataFrame, text_col: str) -> tuple[list[bool], list[int], list[str]]:
         text_series = df[text_col].astype(str)
@@ -1937,9 +1972,28 @@ class ToxicCommentApp:
             self._preview_active = False
             self._preview_text_snapshot = ""
             self._preview_dirty = False
+            self._replace_tox_input_content(text)
+
+    def _replace_tox_input_content(self, text: str) -> None:
+        """Replace editor content even while user editing is temporarily locked.
+
+        Tk ignores ``delete`` and ``insert`` calls on a disabled Text widget.
+        Dataset loading intentionally disables that widget, so preview updates
+        must briefly enable it for the programmatic write and then restore the
+        original state.
+        """
+        if not hasattr(self, "tox_input") or self.tox_input is None:
+            return
+        previous_state = str(self.tox_input.cget("state"))
+        if previous_state == "disabled":
+            self.tox_input.configure(state="normal")
+        try:
             self.tox_input.delete("1.0", END)
             self.tox_input.insert("1.0", text)
             self.tox_input.see("1.0")
+        finally:
+            if previous_state == "disabled":
+                self.tox_input.configure(state="disabled")
 
     def _show_preview(self, df: pd.DataFrame) -> None:
         # Preview panel removed; show dataset preview inside the analysis input.
@@ -1951,7 +2005,6 @@ class ToxicCommentApp:
         if not same_dataset:
             self._preview_segment = 0
         self._preview_columns = None
-        self.tox_input.delete("1.0", END)
         # Use TSV-style preview to avoid padded right-aligned DataFrame formatting.
         start = getattr(self, "_preview_segment", 0) * UI_PREVIEW_MAX_ROWS
         n_show = min(max(0, len(df) - start), UI_PREVIEW_MAX_ROWS)
@@ -1997,12 +2050,11 @@ class ToxicCommentApp:
         header = (
             f"Dataset: {len(df):,} rows, {len(df.columns):,} columns{extra}\n\n"
         )
-        self.tox_input.insert("1.0", preview_str)
+        self._replace_tox_input_content(preview_str)
         total_segments = max(1, (len(df) + UI_PREVIEW_MAX_ROWS - 1) // UI_PREVIEW_MAX_ROWS)
         self._preview_segment_var.set(f"Segment {getattr(self, '_preview_segment', 0) + 1} / {total_segments}")
         self._preview_text_snapshot = self.tox_input.get("1.0", END).strip()
         self._preview_dirty = False
-        self.tox_input.see("1.0")
 
     def _mark_preview_dirty(self, _event: tk.Event | None = None) -> None:
         self._preview_dirty = True

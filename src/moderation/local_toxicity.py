@@ -42,8 +42,26 @@ _DEFAULT_TYPES: tuple[str, ...] = (
     "Religious Intolerance",
 )
 
-_DEFAULT_BATCH_ROWS = 8
-_DEFAULT_BATCH_OUTPUT_TOKENS_PER_ROW = 40
+_DEFAULT_BATCH_ROWS = 1
+_DEFAULT_BATCH_OUTPUT_TOKENS_PER_ROW = 72
+
+_SCORE_FIELDS: tuple[str, ...] = (
+    "toxicity",
+    "severe_toxicity",
+    "identity_attack",
+    "insult",
+    "profanity",
+    "threat",
+)
+
+_UI_SCORE_NAMES: dict[str, str] = {
+    "toxicity": "Toxicity",
+    "severe_toxicity": "Severe Toxicity",
+    "identity_attack": "Identity Attack",
+    "insult": "Insult",
+    "profanity": "Profanity",
+    "threat": "Threat",
+}
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -55,6 +73,8 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 @dataclass(frozen=True)
 class ToxicityAnalysis:
+    overall_score: int
+    scores: dict[str, int]
     category: list[str]
     toxicity_level: str
     toxicity_type: list[str]
@@ -132,8 +152,21 @@ class LocalToxicityAnalyzer:
         self._device = None
 
     def preload(self) -> None:
-        """Load weights + tokenizer onto device (CPU or CUDA). Safe to call from a worker thread."""
+        """Load weights and tokenizer onto the best available device."""
         self._ensure_loaded()
+
+    @property
+    def device_type(self) -> str:
+        """Return the active PyTorch device type after ensuring the model is loaded."""
+        self._ensure_loaded()
+        return str(self._device.type)
+
+    @property
+    def dtype_name(self) -> str:
+        """Return the dtype used by the loaded model parameters."""
+        self._ensure_loaded()
+        assert self._model is not None
+        return str(next(self._model.parameters()).dtype).removeprefix("torch.")
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -172,12 +205,16 @@ class LocalToxicityAnalyzer:
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
+        if device.type == "cuda":
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif device.type == "mps":
+            # Apple Silicon executes this model substantially faster and uses about
+            # half the unified memory in FP16 compared with the former FP32 path.
+            dtype = torch.float16
         else:
             dtype = torch.float32
 
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
+        model = AutoModelForCausalLM.from_config(config, dtype=dtype)
         state = load_file(str(self.weights_path))
         missing, unexpected = model.load_state_dict(state, strict=False)
         if unexpected:
@@ -198,42 +235,12 @@ class LocalToxicityAnalyzer:
         if not text:
             raise ToxicityModelError("Empty input; nothing to classify.")
 
-        self._ensure_loaded()
-        assert self._tokenizer is not None and self._model is not None and self._device is not None
-
-        import torch
-
-        # Some tokenizers (including many locally packaged ones) don't ship a chat_template.
-        # Use a plain-text prompt so local inference works without chat templates.
-        prompt = (
-            "You are a content moderation classifier. Return ONLY valid JSON. No markdown.\n\n"
-            + _build_prompt(text)
-            + "\n\nJSON:"
-        )
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
-
-        try:
-            with torch.no_grad():
-                out = self._model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=1.12,
-                    pad_token_id=(
-                        self._tokenizer.pad_token_id
-                        if self._tokenizer.pad_token_id is not None
-                        else self._tokenizer.eos_token_id
-                    ),
-                )
-        except Exception as exc:
-            raise ToxicityModelError(f"Model generation failed: {exc}") from exc
-
-        gen_ids = out[0, inputs.input_ids.shape[1] :]
-        content = self._tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-        if not content:
-            raise ToxicityModelError("Model returned empty output.")
-
-        return _analysis_from_parsed(_parse_json_object(content), raw_model_output=content)
+        # Use the compact one-row batch schema for single text as well. The model
+        # follows it much more reliably than a separate verbose explanation prompt.
+        results = self.analyze_batch([(1, text)])
+        if not results:
+            raise ToxicityModelError("Model did not return a valid scored result.")
+        return results[0][1]
 
     def token_budgeted_batches(
         self,
@@ -278,9 +285,10 @@ class LocalToxicityAnalyzer:
         assert self._tokenizer is not None and self._model is not None and self._device is not None
 
         import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
 
         prompt = (
-            "You are a content moderation classifier. Return ONLY valid JSON. No markdown.\n\n"
+            "You are a precise content-moderation scoring engine. Return ONLY valid JSON.\n\n"
             + _build_batch_prompt(items)
             + "\n\nJSON:"
         )
@@ -293,13 +301,24 @@ class LocalToxicityAnalyzer:
         )
         max_new_tokens = max(128, min(2048, len(items) * per_row))
 
+        class _StopAfterJsonArray(StoppingCriteria):
+            def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
+                generated = input_ids[0, inputs.input_ids.shape[1] :]
+                text = self_tokenizer.decode(generated, skip_special_tokens=True)
+                return expected_row_ids.issubset(_completed_json_row_ids(text))
+
+        self_tokenizer = self._tokenizer
+        expected_row_ids = {int(row_id) for row_id, _text in items}
+        stopping = StoppingCriteriaList([_StopAfterJsonArray()])
+
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = self._model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     repetition_penalty=1.08,
+                    stopping_criteria=stopping,
                     pad_token_id=(
                         self._tokenizer.pad_token_id
                         if self._tokenizer.pad_token_id is not None
@@ -327,12 +346,8 @@ class LocalToxicityAnalyzer:
             seen.add(row_id)
             out_items.append((row_id, _analysis_from_parsed(obj, raw_model_output=content)))
 
-        if seen != expected:
-            missing = sorted(expected - seen)
-            raise ToxicityModelError(
-                "Batch output did not include every requested row. "
-                f"Missing rows: {missing[:8]}{'...' if len(missing) > 8 else ''}"
-            )
+        # A causal model can hit its output limit after producing several valid
+        # rows. Return those rows so the caller retries only the missing ones.
         return out_items
 
 
@@ -376,20 +391,25 @@ def _build_prompt(text: str) -> str:
     levels = ", ".join(_DEFAULT_LEVELS)
     return (
         "You classify a single user message for moderation.\n\n"
-        "Respond with ONE JSON object and ONLY these four keys (no other keys, no preamble):\n"
-        '"category" (array of 1-3 strings), "toxicity_level" (one string), '
-        '"toxicity_type" (array, often empty), "explanation" (one short string).\n\n'
+        "Respond with ONE JSON object and ONLY these six keys (no other keys, no preamble):\n"
+        '"overall_score" (integer 0-100), "scores" (object), "category" (array of 1-3 strings), '
+        '"toxicity_level" (one string), "toxicity_type" (array), and "explanation" (one short string).\n'
+        'The "scores" object must contain exactly: "toxicity", "severe_toxicity", '
+        '"identity_attack", "insult", "profanity", and "threat", each an integer 0-100.\n\n'
         "Rules:\n"
         "- Do NOT output tasks, instructions, allowed lists, or schema inside JSON.\n"
         '- Arrays must stay short (category ≤3 items, toxicity_type ≤4 items).\n'
         "- Use comma-separated JSON arrays only; never use '|' inside arrays.\n"
-        "- If text is fine, use category [\"None\"], level \"Low\", toxicity_type [].\n\n"
+        "- Scores are your direct assessment; 0 means absent and 100 means unmistakable.\n"
+        "- Greetings, ordinary questions, incomplete grammar, and polite conversation are not toxic.\n"
+        "- Identity attack requires an attack on a person or group because of an identity; never infer one without such a target.\n"
+        "- If text is harmless, set overall_score and every score to 0, category [\"None\"], level \"Low\", toxicity_type [].\n\n"
         "Allowed category strings (pick the best fit): "
         f"{cats}.\n"
         f"Allowed levels: {levels}.\n"
         f"Optional toxicity_type strings (omit unknowns): {types_ex}.\n\n"
-        "Example shape:\n"
-        '{"category":["None"],"toxicity_level":"Low","toxicity_type":[],"explanation":"No harm detected."}\n\n'
+        "Neutral example:\n"
+        '{"overall_score":0,"scores":{"toxicity":0,"severe_toxicity":0,"identity_attack":0,"insult":0,"profanity":0,"threat":0},"category":["None"],"toxicity_level":"Low","toxicity_type":[],"explanation":"Neutral conversation."}\n\n'
         "Message to classify:\n"
         f"{text}"
     )
@@ -407,17 +427,29 @@ def _build_batch_prompt(items: list[tuple[int, str]]) -> str:
         "Classify each numbered message for moderation.\n\n"
         "Respond with ONE JSON array. The array must contain exactly one object for each input row.\n"
         "Each object must have exactly these keys: "
-        '"row_id", "category", "toxicity_level", "toxicity_type", "explanation".\n\n'
+        '"row_id", "overall_score", "scores", "category", "toxicity_level", "toxicity_type".\n'
+        'The "scores" object must contain exactly: "toxicity", "severe_toxicity", '
+        '"identity_attack", "insult", "profanity", and "threat", each an integer 0-100.\n\n'
         "Rules:\n"
         "- Do not skip rows and do not add extra rows.\n"
-        "- Keep explanations very short.\n"
         "- Arrays must stay short: category <= 3, toxicity_type <= 4.\n"
-        '- If text is fine, use category ["None"], level "Low", toxicity_type [].\n\n'
+        "- Scores are direct assessments; 0 means absent and 100 means unmistakable.\n"
+        "- Score only harmful meaning present in the message; never invent an unstated target or intent.\n"
+        "- Greetings, ordinary questions, incomplete grammar, positive statements, and routine requests are not toxic.\n"
+        "- Words such as 'how are you', 'excellent', 'thank you', and 'please send' are neutral by themselves.\n"
+        "- Identity attack requires an attack based on an identity; never infer one without a target.\n"
+        "- A generic disagreement or criticism is not an identity attack.\n"
+        "- A direct personal insult such as 'you are stupid' is toxic and must have nonzero toxicity and insult scores.\n"
+        "- Explicit profanity or a direct threat must receive a nonzero score in its matching field.\n"
+        "Calibration anchors (examples only, not input rows):\n"
+        '- Neutral greeting "Hope you are well": overall_score 0, scores [0,0,0,0,0,0].\n'
+        '- Direct insult "You are an idiot": overall_score 65, scores [70,10,0,80,0,0].\n'
+        '- Direct violent threat "I will kill you": overall_score 95, scores [95,85,0,20,0,100].\n'
+        '- If text is harmless, use overall_score 0, all six scores 0, category ["None"], level "Low", toxicity_type [].\n\n'
         f"Allowed category strings: {cats}.\n"
         f"Allowed levels: {levels}.\n"
         f"Optional toxicity_type strings: {types_ex}.\n\n"
-        "Example shape:\n"
-        '[{"row_id":1,"category":["None"],"toxicity_level":"Low","toxicity_type":[],"explanation":"No harm detected."}]\n\n'
+        "Start the response with [ and do not close the response until every listed row_id has one result.\n\n"
         "Messages:\n"
         + "\n".join(lines)
     )
@@ -434,6 +466,51 @@ def _model_context_window(model: Any, tokenizer: Any) -> int:
         if isinstance(val, int) and val > 0:
             candidates.append(val)
     return min(candidates) if candidates else 4096
+
+
+def _has_complete_json_container(raw: str, *, opening: str) -> bool:
+    """Return True once the first JSON object/array is structurally complete."""
+    start = raw.find(opening)
+    if start < 0:
+        return False
+    pairs = {"[": "]", "{": "}"}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in raw[start:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in ("]", "}"):
+            if not stack or char != stack.pop():
+                return False
+            if not stack:
+                return True
+    return False
+
+
+def _completed_json_row_ids(raw: str) -> set[int]:
+    """Return row IDs whose generated JSON objects are structurally complete."""
+    completed: set[int] = set()
+    for match in re.finditer(r"\{\s*\"row_id\"\s*:", raw):
+        blob = _brace_balanced_object(raw, match.start())
+        if not blob:
+            continue
+        try:
+            obj = json.loads(blob)
+            completed.add(int(obj.get("row_id")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return completed
 
 
 def _brace_balanced_object(s: str, open_brace: int) -> str | None:
@@ -465,9 +542,9 @@ def _brace_balanced_object(s: str, open_brace: int) -> str | None:
 
 
 def _classification_json_candidates(raw: str) -> list[str]:
-    """Pull balanced JSON objects whose first key is category (ignores leading schema junk)."""
+    """Pull balanced result objects while ignoring leading schema junk."""
     out: list[str] = []
-    for m in re.finditer(r"\{\s*\"category\"\s*:", raw):
+    for m in re.finditer(r"\{\s*\"(?:overall_score|scores|category)\"\s*:", raw):
         blob = _brace_balanced_object(raw, m.start())
         if blob:
             out.append(blob)
@@ -595,6 +672,27 @@ def _parse_json_array(text: str) -> list[Any]:
         except Exception as exc:
             last_err = exc
 
+    # Generation can stop at max_new_tokens before the closing array bracket.
+    # Salvage every fully balanced row object instead of throwing away useful
+    # inference work and forcing the UI to rerun the complete batch.
+    recovered: list[dict[str, Any]] = []
+    seen_row_ids: set[int] = set()
+    for match in re.finditer(r"\{\s*\"row_id\"\s*:", t):
+        blob = _brace_balanced_object(t, match.start())
+        if not blob:
+            continue
+        try:
+            obj = json.loads(blob)
+            row_id = int(obj.get("row_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if row_id in seen_row_ids:
+            continue
+        seen_row_ids.add(row_id)
+        recovered.append(obj)
+    if recovered:
+        return recovered
+
     detail = (
         f"Failed to parse batch JSON. Raw output truncated:\n{text[:1600]}..."
         if len(text) > 1600
@@ -619,14 +717,47 @@ def _analysis_from_parsed(parsed: dict[str, Any], *, raw_model_output: str) -> T
     if len(tox_types) >= max(5, len(_DEFAULT_TYPES) - 2):
         tox_types = []
     explanation = str(parsed.get("explanation") or "").strip()
+    scores = _normalize_direct_scores(parsed.get("scores"))
+    overall_score = _normalize_direct_score(parsed.get("overall_score"), field="overall_score")
 
     return ToxicityAnalysis(
+        overall_score=overall_score,
+        scores=scores,
         category=category,
         toxicity_level=toxicity_level,
         toxicity_type=tox_types,
         explanation=explanation,
         raw_model_output=raw_model_output,
     )
+
+
+def _normalize_direct_score(value: Any, *, field: str) -> int:
+    """Validate one model-provided score without deriving it from another label."""
+    if isinstance(value, bool):
+        raise ToxicityModelError(f"Model score '{field}' must be a number from 0 to 100.")
+    try:
+        score = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ToxicityModelError(f"Model score '{field}' is missing or invalid.") from exc
+    if not score.is_integer() or not 0 <= score <= 100:
+        raise ToxicityModelError(f"Model score '{field}' must be an integer from 0 to 100.")
+    return int(score)
+
+
+def _normalize_direct_scores(value: Any) -> dict[str, int]:
+    if isinstance(value, list):
+        if len(value) != len(_SCORE_FIELDS):
+            raise ToxicityModelError("Model 'scores' array must contain exactly six values.")
+        return {
+            _UI_SCORE_NAMES[field]: _normalize_direct_score(value[index], field=field)
+            for index, field in enumerate(_SCORE_FIELDS)
+        }
+    if not isinstance(value, dict):
+        raise ToxicityModelError("Model output is missing the required 'scores' array.")
+    return {
+        _UI_SCORE_NAMES[field]: _normalize_direct_score(value.get(field), field=field)
+        for field in _SCORE_FIELDS
+    }
 
 
 def _coerce_toxicity_type_token(raw: str) -> str | None:
