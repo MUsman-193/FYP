@@ -415,17 +415,23 @@ class TextPreprocessor:
         non_ascii_chars = 0
         slang_hint_rows = 0
         quote_fence_rows = 0
+        punctuation_only_rows = 0
+        punctuation_heavy_rows = 0
+        repeated_punctuation_rows = 0
 
         url_re = re.compile(r"https?://|www\.", re.I)
         mention_re = re.compile(r"@\w")
         tag_re = re.compile(r"<[^>]{1,2000}>")
         elong_re = re.compile(r"(.)\1{2,}")
+        repeated_punctuation_re = re.compile(r"[^\w\s]{3,}", re.UNICODE)
 
         for raw in texts:
             text = "" if raw is None else str(raw)
+            non_whitespace = [ch for ch in text if not ch.isspace()]
+            row_punctuation = sum(1 for ch in non_whitespace if self._is_punctuation_char(ch))
             total_chars += len(text)
             uppercase_chars += sum(1 for ch in text if ch.isupper())
-            punctuation_chars += sum(1 for ch in text if self._is_punctuation_char(ch))
+            punctuation_chars += row_punctuation
             digit_chars += sum(1 for ch in text if ch.isdigit())
             non_ascii_chars += sum(1 for ch in text if ord(ch) > 127)
             if re.search(r"\s{2,}|\n|\t", text):
@@ -440,6 +446,16 @@ class TextPreprocessor:
                 elong_rows += 1
             if _QUOTE_FENCE_RE.search(text):
                 quote_fence_rows += 1
+            if non_whitespace and row_punctuation == len(non_whitespace):
+                punctuation_only_rows += 1
+            if (
+                len(non_whitespace) >= 4
+                and row_punctuation >= 4
+                and row_punctuation / len(non_whitespace) >= 0.30
+            ):
+                punctuation_heavy_rows += 1
+            if repeated_punctuation_re.search(text):
+                repeated_punctuation_rows += 1
 
             tokens = text.split()
             if tokens:
@@ -466,6 +482,16 @@ class TextPreprocessor:
         elong_ratio = elong_rows / n
         slang_hint_ratio = slang_hint_rows / n
         quote_fence_ratio = quote_fence_rows / n
+        punctuation_only_ratio = punctuation_only_rows / n
+        punctuation_heavy_ratio = punctuation_heavy_rows / n
+        repeated_punctuation_ratio = repeated_punctuation_rows / n
+
+        suggest_remove_punctuation = (
+            punctuation_ratio > 0.05
+            or punctuation_only_ratio >= 0.005
+            or punctuation_heavy_ratio >= 0.02
+            or repeated_punctuation_ratio >= 0.02
+        )
 
         noisy = (
             url_ratio > 0.02
@@ -476,7 +502,7 @@ class TextPreprocessor:
 
         config = PreprocessConfig(
             lowercase=uppercase_ratio > 0.08,
-            remove_punctuation=punctuation_ratio > 0.05,
+            remove_punctuation=suggest_remove_punctuation,
             remove_stopwords=stopword_ratio > 0.35,
             remove_numbers=digit_ratio > 0.03,
             normalize_whitespace=messy_ws_ratio > 0.20,
@@ -490,6 +516,9 @@ class TextPreprocessor:
         stats = {
             "uppercase_ratio": round(uppercase_ratio, 4),
             "punctuation_ratio": round(punctuation_ratio, 4),
+            "rows_with_punctuation_only": round(punctuation_only_ratio, 4),
+            "rows_with_heavy_punctuation": round(punctuation_heavy_ratio, 4),
+            "rows_with_repeated_punctuation": round(repeated_punctuation_ratio, 4),
             "digit_ratio": round(digit_ratio, 4),
             "messy_whitespace_ratio": round(messy_ws_ratio, 4),
             "avg_stopword_ratio": round(stopword_ratio, 4),
